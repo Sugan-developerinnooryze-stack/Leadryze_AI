@@ -1,0 +1,104 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const config = {
+  app: {
+    env: process.env.NODE_ENV || 'development',
+    port: parseInt(process.env.PORT || '5001', 10),
+    internalApiKey: process.env.INTERNAL_API_KEY || 'internal-key',
+  },
+  llm: {
+    provider: (process.env.LLM_PROVIDER || 'anthropic') as 'openai' | 'anthropic' | 'gemini' | 'groq' | 'local',
+    model: process.env.LLM_MODEL || 'claude-haiku-4-5-20251001',
+    fallbackProvider: (process.env.LLM_FALLBACK_PROVIDER || 'openai') as 'openai' | 'anthropic' | 'gemini' | 'groq' | 'local',
+    fallbackModel: process.env.LLM_FALLBACK_MODEL || 'gpt-4o-mini',
+    maxTokens: parseInt(process.env.MAX_TOKENS_PER_REQUEST || '4096', 10),
+  },
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY || '',
+    orgId: process.env.OPENAI_ORG_ID || '',
+  },
+  anthropic: {
+    apiKey: process.env.ANTHROPIC_API_KEY || '',
+  },
+  google: {
+    apiKey: process.env.GOOGLE_API_KEY || '',
+  },
+  groq: {
+    apiKey: process.env.GROQ_API_KEY || '',
+  },
+  embeddings: {
+    provider: process.env.EMBEDDING_PROVIDER || 'voyage',
+    model: process.env.EMBEDDING_MODEL || 'voyage-3',
+  },
+  voyage: {
+    apiKey: process.env.VOYAGE_API_KEY || '',
+  },
+  qdrant: {
+    url: process.env.QDRANT_URL || 'http://localhost:6333',
+    apiKey: process.env.QDRANT_API_KEY || '',
+    collection: process.env.QDRANT_COLLECTION || 'leadryze_knowledge',
+  },
+  redis: {
+    url: process.env.REDIS_URL || '',
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    password: process.env.REDIS_PASSWORD || '',
+    tls: process.env.REDIS_TLS === 'true',
+  },
+  guardrails: {
+    enableModeration: process.env.ENABLE_CONTENT_MODERATION !== 'false',
+    enablePiiFilter: process.env.ENABLE_PII_FILTER !== 'false',
+    maxRequestsPerTenantPerHour: parseInt(
+      process.env.MAX_REQUESTS_PER_TENANT_PER_HOUR || '500',
+      10
+    ),
+    maxTemplateAnalysesPerTenantPerDay: parseInt(
+      process.env.MAX_TEMPLATE_ANALYSES_PER_TENANT_PER_DAY || '20',
+      10
+    ),
+  },
+  // PDF/Image Template Analyzer — a one-shot structured-extraction call, not
+  // part of the conversational/RAG agent flow, so it calls @google/genai
+  // directly rather than going through llm.provider.ts's LangChain
+  // abstraction (which only supports plain-text messages, no document/image
+  // content parts). Gemini natively accepts both PDF and image input with a
+  // free tier — chosen after the Anthropic account this originally used hit
+  // a billing/credit limit.
+  templateAnalyzer: {
+    // 'gemini-flash-latest' is Google's maintained alias for their current
+    // flash model — verified live against this key: pinned versions like
+    // 'gemini-2.5-flash' can get cut off from new API keys/projects (as
+    // happened here) even while still listed in the model catalog; the
+    // alias avoids re-hitting that wall as models rotate over time.
+    model: process.env.TEMPLATE_ANALYZER_MODEL || 'gemini-flash-latest',
+    // gemini-flash-latest's real ceiling is 65536 (checked via the live
+    // models list for this key) — 8000 was hit exactly on a real dense
+    // invoice (candidatesTokenCount 7984/8000, finishReason MAX_TOKENS).
+    // 32000 leaves generous headroom while still bounding worst-case cost.
+    maxTokens: parseInt(process.env.TEMPLATE_ANALYZER_MAX_TOKENS || '32000', 10),
+    maxPdfPages: parseInt(process.env.TEMPLATE_ANALYZER_MAX_PDF_PAGES || '10', 10),
+  },
+  backend: {
+    url: process.env.BACKEND_URL || 'http://localhost:5000',
+    internalServiceKey: process.env.INTERNAL_SERVICE_KEY || 'leadryze-service-key-change-in-prod',
+  },
+  logging: {
+    level: process.env.LOG_LEVEL || 'info',
+    dir: process.env.LOG_DIR || './logs',
+  },
+};
+
+if (config.app.env === 'production') {
+  const aiInsecureChecks: Array<[string, string, string]> = [
+    ['INTERNAL_API_KEY',     config.app.internalApiKey,         'internal-key'],
+    ['INTERNAL_SERVICE_KEY', config.backend.internalServiceKey, 'leadryze-service-key-change-in-prod'],
+  ];
+  for (const [name, value, badDefault] of aiInsecureChecks) {
+    if (!value || value === badDefault || value.length < 16) {
+      throw new Error(
+        `[AI CONFIG] ${name} is insecure or missing. Set a strong unique value in production .env before starting.`
+      );
+    }
+  }
+}
