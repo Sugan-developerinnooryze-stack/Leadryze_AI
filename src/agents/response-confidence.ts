@@ -11,7 +11,7 @@ import type { ToolCallLog } from '../tools/runner';
  * score clear a real bar — and decides from those instead.
  */
 export interface ConfidenceResult {
-  source: 'product_catalog' | 'website_rag' | 'general';
+  source: 'product_catalog' | 'booking' | 'website_rag' | 'general';
   confidence: number;
 }
 
@@ -29,6 +29,18 @@ export function classifyResponseConfidence(
     (t) => (t.name === 'search_products' || t.name === 'get_product_details') && t.ok && t.data
   );
   if (productHit) return { source: 'product_catalog', confidence: 0.9 };
+
+  // A successful booking-tool call means real, structured data was found or
+  // acted on (real availability, a real confirmed meeting) — same
+  // "confident, don't second-guess it" category as a product-catalog hit.
+  // Without this branch, these fall through to the ambient RAG score below,
+  // which is 0 for any tenant that hasn't crawled their website yet —
+  // incorrectly overriding a perfectly good booking answer with the
+  // low-confidence deflection message.
+  const bookingHit = toolCallsLog.find(
+    (t) => (t.name === 'check_meeting_availability' || t.name === 'book_meeting') && t.ok
+  );
+  if (bookingHit) return { source: 'booking', confidence: 0.9 };
 
   const ragToolHit = toolCallsLog.find(
     (t) => t.name === 'search_website_knowledge' && t.ok && typeof t.data?.topScore === 'number'
