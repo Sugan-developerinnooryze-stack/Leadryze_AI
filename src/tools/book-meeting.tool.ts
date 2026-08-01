@@ -1,21 +1,11 @@
 import { z } from 'zod';
 import { AgentTool } from './tool.types';
 import { backendClient } from '../services/backend.client';
+import { cleanArg } from '../utils/clean-arg';
 import {
   getBookingState, setBookingState,
   getLeadCaptureState, setLeadCaptureState,
 } from '../memory/conversation.memory';
-
-// Groq's small model occasionally emits the literal string "null" (or
-// "undefined"/"n/a") for a field it doesn't actually know, instead of
-// omitting the key — confirmed live via testing. z.string().optional()
-// happily accepts that as a real, truthy string, which would otherwise
-// pass the "do we have enough info" guard below with garbage contact data.
-function cleanArg(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  return /^(null|undefined|n\/a|none)$/i.test(trimmed) ? undefined : trimmed;
-}
 
 const schema = z.object({
   startIso: z.string().describe('The exact startIso of one of the times just offered by check_meeting_availability — never a time you invented yourself'),

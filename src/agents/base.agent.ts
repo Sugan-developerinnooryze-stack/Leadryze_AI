@@ -16,6 +16,7 @@ import { moderateContent, detectPromptInjection } from '../core/guardrails/moder
 import { maskPIIForLLM } from '../core/guardrails/pii-filter';
 import { checkTenantRateLimit, checkTenantTokenQuota } from '../core/guardrails/rate-limiter';
 import { resolveTenantConfig } from '../services/context.builder';
+import { cleanArg } from '../utils/clean-arg';
 import { backendClient, type CRMSearchResult } from '../services/backend.client';
 import { buildCRMQueryPrompt } from '../prompts/system.prompts';
 import { LeadFieldExtractionSchema } from './widget-lead.schema';
@@ -144,11 +145,22 @@ async function maybeCaptureWidgetLead(
           ],
           LeadFieldExtractionSchema,
         );
-        if (extraction.firstName && !state.firstName) state.firstName = extraction.firstName;
-        if (extraction.lastName && !state.lastName)   state.lastName  = extraction.lastName;
-        if (extraction.email && !state.email)         state.email     = extraction.email;
-        if (extraction.phone && !state.phone)         state.phone     = extraction.phone;
-        if (extraction.company && !state.company)     state.company   = extraction.company;
+        // cleanArg() guards against Groq's occasional literal-string "null"
+        // (instead of real JSON null) for a field it doesn't know — without
+        // this, z.string().nullable() lets "null" through as a truthy
+        // string, producing a Lead with firstName/lastName literally set to
+        // the text "null" (confirmed live: exactly this happened for a real
+        // Doctor-tenant conversation before this fix).
+        const cFirst = cleanArg(extraction.firstName ?? undefined);
+        const cLast  = cleanArg(extraction.lastName ?? undefined);
+        const cEmail = cleanArg(extraction.email ?? undefined);
+        const cPhone = cleanArg(extraction.phone ?? undefined);
+        const cCompany = cleanArg(extraction.company ?? undefined);
+        if (cFirst && !state.firstName)   state.firstName = cFirst;
+        if (cLast && !state.lastName)     state.lastName  = cLast;
+        if (cEmail && !state.email)       state.email     = cEmail;
+        if (cPhone && !state.phone)       state.phone     = cPhone;
+        if (cCompany && !state.company)   state.company   = cCompany;
       } catch (err) {
         logger.warn('Widget lead-field structured extraction failed', {
           sessionId: input.sessionId, error: (err as Error).message,
