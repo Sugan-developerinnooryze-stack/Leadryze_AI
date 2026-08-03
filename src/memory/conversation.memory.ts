@@ -211,7 +211,7 @@ export async function setLeadCaptureState(sessionId: string, state: LeadCaptureS
  * could otherwise invent a plausible-looking time that was never actually
  * free). `meetingCreated` mirrors leadCreated's idempotency role. */
 export interface BookingState {
-  offeredSlots?: Array<{ startIso: string; endIso: string }>;
+  offeredSlots?: Array<{ startIso: string; endIso: string; label?: string }>;
   offeredAt?: number;
   meetingCreated?: boolean;
   meetingId?: string;
@@ -224,6 +224,12 @@ export interface BookingState {
   selectedTeamName?: string;
   selectedStaffId?: string;
   selectedStaffName?: string;
+  /** Set by the deterministic booking-confirmation shortcut the moment it
+   * resolves a specific slot (by time, ordinal, or a bare affirmative with
+   * only one slot offered) — so a LATER turn that only supplies contact
+   * info (without restating the time) still knows which slot was already
+   * confirmed. Cleared once meetingCreated is set. */
+  confirmingSlot?: { startIso: string; endIso: string; label?: string };
 }
 
 export async function getBookingState(sessionId: string): Promise<BookingState | null> {

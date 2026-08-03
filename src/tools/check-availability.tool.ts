@@ -35,8 +35,9 @@ export const checkMeetingAvailabilityTool: AgentTool<z.infer<typeof schema>> = {
     await setBookingState(ctx.sessionId, {
       ...booking,
       selectedStaffId: staffId || booking.selectedStaffId,
-      offeredSlots: shown.map((s) => ({ startIso: s.startIso, endIso: s.endIso })),
+      offeredSlots: shown.map((s) => ({ startIso: s.startIso, endIso: s.endIso, label: s.label })),
       offeredAt: Date.now(),
+      confirmingSlot: undefined,
     });
 
     return {

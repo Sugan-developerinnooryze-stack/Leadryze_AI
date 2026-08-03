@@ -569,7 +569,7 @@ class BackendClient {
     tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
     startIso: string; endIso: string; firstName: string; lastName?: string; email?: string; phone?: string; topic?: string;
     staffId?: string;
-  }): Promise<{ success: boolean; meetingId?: string; staffName?: string; leadId?: string; alreadyCreated?: boolean; error?: string }> {
+  }): Promise<{ success: boolean; meetingId?: string; staffName?: string; leadId?: string; alreadyCreated?: boolean; error?: string; reason?: 'slot_taken' }> {
     try {
       const res = await this.http.post<{ data: { meetingId: string; staffName?: string; leadId: string; alreadyCreated?: boolean } }>(
         '/api/internal/widget-book-meeting', params,
@@ -578,7 +578,12 @@ class BackendClient {
     } catch (err: any) {
       const message = err?.response?.data?.message || (err as Error).message;
       logger.warn('BackendClient: bookWidgetMeeting failed', { error: message, tenantId: params.tenantId });
-      return { success: false, error: message };
+      // A 409 always means the slot itself is unavailable (pre-check or the
+      // race-guard unique index) — checked via status code, not the message
+      // string, so a later wording change to either backend message can't
+      // silently break this.
+      const reason = err?.response?.status === 409 ? ('slot_taken' as const) : undefined;
+      return { success: false, error: message, reason };
     }
   }
 

@@ -17,6 +17,62 @@ const schema = z.object({
   staffId: z.string().optional().describe('The exact staffId of the doctor the visitor chose from list_doctors, if this business has departments — omit otherwise'),
 });
 
+export interface PerformBookingParams {
+  tenantId: string; sessionId: string; visitorId?: string; pageUrl?: string;
+  slot: { startIso: string; endIso: string; label?: string };
+  firstName: string; lastName?: string; email?: string; phone?: string; topic?: string; staffId?: string;
+}
+
+export interface PerformBookingResult {
+  ok: boolean;
+  summary: string;
+  meetingId?: string;
+  staffName?: string;
+  alreadyCreated?: boolean;
+  slotTaken?: boolean;
+}
+
+/** The real booking logic, shared by the LLM-facing tool below AND the
+ * deterministic booking-confirmation shortcut (booking-confirmation-
+ * shortcut.ts) — extracted so both call the exact same code rather than
+ * duplicating it. Callers are expected to have already resolved `slot` from
+ * BookingState.offeredSlots and merged contact info with LeadCaptureState;
+ * this function only does the actual booking + state persistence. */
+export async function performBooking(params: PerformBookingParams): Promise<PerformBookingResult> {
+  const { tenantId, sessionId, visitorId, pageUrl, slot, firstName, lastName, email, phone, topic, staffId } = params;
+
+  const result = await backendClient.bookWidgetMeeting({
+    tenantId, sessionId, visitorId, sourceUrl: pageUrl,
+    startIso: slot.startIso, endIso: slot.endIso, firstName, lastName, email, phone, topic, staffId,
+  });
+
+  if (!result.success) {
+    return {
+      ok: false,
+      summary: `Could not book that time: ${result.error || 'please try another slot.'}`,
+      slotTaken: result.reason === 'slot_taken',
+    };
+  }
+
+  const booking = (await getBookingState(sessionId)) ?? {};
+  await setBookingState(sessionId, { ...booking, meetingCreated: true, meetingId: result.meetingId, confirmingSlot: undefined });
+  // Keep LeadCaptureState in sync so maybeCaptureWidgetLead() (which runs
+  // unconditionally after this) sees leadCreated:true and never attempts a
+  // second, competing Lead for the same session.
+  const lead = (await getLeadCaptureState(sessionId)) ?? {};
+  await setLeadCaptureState(sessionId, { ...lead, firstName, lastName, email, phone, service: lead.service || topic || undefined, leadCreated: true, leadId: result.leadId });
+
+  return {
+    ok: true,
+    summary: result.alreadyCreated
+      ? 'This meeting was already booked.'
+      : `Booked${result.staffName ? ` with ${result.staffName}` : ''} — tell the visitor it's confirmed.`,
+    meetingId: result.meetingId,
+    staffName: result.staffName,
+    alreadyCreated: result.alreadyCreated,
+  };
+}
+
 export const bookMeetingTool: AgentTool<z.infer<typeof schema>> = {
   name: 'book_meeting',
   description:
@@ -56,26 +112,11 @@ export const bookMeetingTool: AgentTool<z.infer<typeof schema>> = {
 
     const staffId = cleanArg(args.staffId) || booking.selectedStaffId;
 
-    const result = await backendClient.bookWidgetMeeting({
-      tenantId: ctx.tenantId, sessionId: ctx.sessionId, visitorId: ctx.visitorId, sourceUrl: ctx.pageUrl,
-      startIso: slot.startIso, endIso: slot.endIso, firstName, lastName, email, phone, topic, staffId,
+    const result = await performBooking({
+      tenantId: ctx.tenantId, sessionId: ctx.sessionId, visitorId: ctx.visitorId, pageUrl: ctx.pageUrl,
+      slot, firstName, lastName, email, phone, topic, staffId,
     });
 
-    if (!result.success) {
-      return { ok: false, summary: `Could not book that time: ${result.error || 'please try another slot.'}` };
-    }
-
-    await setBookingState(ctx.sessionId, { ...booking, meetingCreated: true, meetingId: result.meetingId });
-    // Keep LeadCaptureState in sync so maybeCaptureWidgetLead() (which runs
-    // unconditionally after this) sees leadCreated:true and never attempts a
-    // second, competing Lead for the same session.
-    await setLeadCaptureState(ctx.sessionId, { ...lead, firstName, lastName, email, phone, service: lead.service || topic || undefined, leadCreated: true, leadId: result.leadId });
-
-    return {
-      ok: true,
-      summary: result.alreadyCreated
-        ? 'This meeting was already booked.'
-        : `Booked${result.staffName ? ` with ${result.staffName}` : ''} — tell the visitor it's confirmed.`,
-    };
+    return { ok: result.ok, summary: result.summary };
   },
 };

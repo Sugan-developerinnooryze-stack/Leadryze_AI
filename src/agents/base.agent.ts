@@ -19,6 +19,8 @@ import { maskPIIForLLM } from '../core/guardrails/pii-filter';
 import { checkTenantRateLimit, checkTenantTokenQuota } from '../core/guardrails/rate-limiter';
 import { resolveTenantConfig } from '../services/context.builder';
 import { cleanArg } from '../utils/clean-arg';
+import { extractCapturedData } from '../utils/extract-captured-data';
+import { tryBookingConfirmationShortcut } from './booking-confirmation-shortcut';
 import { backendClient, type CRMSearchResult } from '../services/backend.client';
 import { buildCRMQueryPrompt } from '../prompts/system.prompts';
 import { LeadFieldExtractionSchema } from './widget-lead.schema';
@@ -84,29 +86,6 @@ function shouldEscalate(response: string, userMessage: string): boolean {
     AI_ESCALATION_PHRASES.some((s) => responseLower.includes(s)) ||
     USER_ESCALATION_PHRASES.some((s) => userLower.includes(s))
   );
-}
-
-function extractCapturedData(userMessage: string): Record<string, string> {
-  const data: Record<string, string> = {};
-
-  const emailMatch = userMessage.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/);
-  if (emailMatch) data.email = emailMatch[0];
-
-  const phoneMatch = userMessage.match(
-    /\b(?:\+?\d{1,3}[\s-]?)?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}\b/
-  );
-  if (phoneMatch) data.phone = phoneMatch[0].trim();
-
-  const namePatterns = [
-    /(?:my name is|i am|i'm|call me)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
-    /(?:name:\s*)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
-  ];
-  for (const p of namePatterns) {
-    const m = userMessage.match(p);
-    if (m) { data.name = m[1]; break; }
-  }
-
-  return data;
 }
 
 /** The public website widget's own lead-capture-to-CRM flow. Only ever runs
@@ -1160,6 +1139,33 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       escalate: false,
       capturedData: {},
     };
+  }
+
+  /* ── Deterministic booking-confirmation shortcut — checked BEFORE
+     checkFastPath() on purpose: fast-path's own ACKNOWLEDGMENTS set already
+     exact-matches bare replies like "ok"/"sure"/"perfect", which would
+     otherwise swallow a visitor confirming a single offered slot before this
+     ever runs. Public widget only, and a no-op for the overwhelming majority
+     of turns (returns immediately whenever no slots are currently offered).
+     See booking-confirmation-shortcut.ts for why this exists — book_meeting
+     is nearly always the fragile SECOND tool call in a conversation. ── */
+  if (isPublicVisitor) {
+    const shortcut = await tryBookingConfirmationShortcut(
+      cleanMessage,
+      { tenantId: input.tenantId, sessionId: input.sessionId, visitorId: input.visitorId, pageUrl: input.pageUrl },
+      bookingState ?? {},
+      leadCaptureState ?? {},
+    );
+    if (shortcut.handled && shortcut.response) {
+      await Promise.all([
+        appendMessage(input.sessionId, { role: 'user',      content: input.message,     timestamp: Date.now() }),
+        appendMessage(input.sessionId, { role: 'assistant', content: shortcut.response,  timestamp: Date.now() }),
+      ]);
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: shortcut.response });
+      logger.info('Deterministic booking-confirmation shortcut handled this turn (no LLM used)', { tenantId: input.tenantId, sessionId: input.sessionId });
+      return { response: shortcut.response, escalate: false, capturedData: extractCapturedData(input.message) };
+    }
   }
 
   /* ── Fast-path: instant responses for greetings / off-topic — zero LLM cost.
