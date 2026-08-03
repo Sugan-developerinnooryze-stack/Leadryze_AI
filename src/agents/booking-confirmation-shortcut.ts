@@ -2,7 +2,7 @@ import { cleanArg } from '../utils/clean-arg';
 import { extractCapturedData } from '../utils/extract-captured-data';
 import { backendClient } from '../services/backend.client';
 import { performBooking } from '../tools/book-meeting.tool';
-import { setBookingState, type BookingState, type LeadCaptureState } from '../memory/conversation.memory';
+import { setBookingState, setLeadCaptureState, type BookingState, type LeadCaptureState } from '../memory/conversation.memory';
 
 export interface BookingShortcutResult {
   handled: boolean;
@@ -136,7 +136,7 @@ export async function tryBookingConfirmationShortcut(
   // never over-triggers on an ordinary, unrelated message elsewhere.
   if (!firstName && bookingState.confirmingSlot) {
     const firstSegment = message.split(/[,;]| and /i)[0].trim();
-    if (/^[A-Z][a-zA-Z'-]+(\s+[A-Z][a-zA-Z'-]+)?$/.test(firstSegment)) {
+    if (/^[A-Z][a-zA-Z'-]+(\s+[A-Z][a-zA-Z'-]+)?$/i.test(firstSegment)) {
       const parts = firstSegment.split(/\s+/).filter(Boolean);
       firstName = parts[0];
       if (parts.length > 1) lastName = parts.slice(1).join(' ');
@@ -144,10 +144,26 @@ export async function tryBookingConfirmationShortcut(
   }
 
   if (!firstName || (!email && !phone)) {
+    // Persist whatever WAS extracted this turn — even though it's still
+    // incomplete — merged over what's already known. Without this, info
+    // given across separate turns (name in one message, email in the next)
+    // is silently discarded and the same "please give me your name and
+    // contact" question repeats forever, since each turn's extraction was
+    // only ever compared against an empty LeadCaptureState.
     await setBookingState(ctx.sessionId, { ...bookingState, confirmingSlot: slot });
+    await setLeadCaptureState(ctx.sessionId, {
+      ...leadCaptureState,
+      firstName: firstName || leadCaptureState.firstName,
+      lastName: lastName || leadCaptureState.lastName,
+      email: email || leadCaptureState.email,
+      phone: phone || leadCaptureState.phone,
+    });
+    const stillNeeded: string[] = [];
+    if (!firstName) stillNeeded.push('your name');
+    if (!email && !phone) stillNeeded.push('an email or phone number');
     return {
       handled: true,
-      response: `Great, I can pencil you in for ${slot.label ?? 'that time'}! Could I get your name and an email or phone number to confirm it?`,
+      response: `Great, I can pencil you in for ${slot.label ?? 'that time'}! Could I get ${stillNeeded.join(' and ')} to confirm it?`,
     };
   }
 
