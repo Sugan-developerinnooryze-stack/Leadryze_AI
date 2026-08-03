@@ -3,6 +3,7 @@ import Fuse from 'fuse.js';
 import { z } from 'zod';
 import type { UsageMetadata } from '@langchain/core/messages';
 import { llm, LLMMessage } from '../core/model-abstraction/llm.provider';
+import { TOOL_MODEL_PRESETS } from '../config';
 import { estimateCostUsd } from '../config/token-cost';
 import { buildRAGContextWithConfidence } from '../rag/pipeline';
 import { classifyResponseConfidence, CONFIDENCE_THRESHOLD } from './response-confidence';
@@ -10,6 +11,7 @@ import {
   getHistory, appendMessage, getCRMState, setCRMState,
   getPendingIntent, setPendingIntent, clearPendingIntent,
   getLeadCaptureState, setLeadCaptureState, type LeadCaptureState,
+  getBookingState, type BookingState,
   type PendingIntent,
 } from '../memory/conversation.memory';
 import { moderateContent, detectPromptInjection } from '../core/guardrails/moderation';
@@ -21,6 +23,7 @@ import { backendClient, type CRMSearchResult } from '../services/backend.client'
 import { buildCRMQueryPrompt } from '../prompts/system.prompts';
 import { LeadFieldExtractionSchema } from './widget-lead.schema';
 import { checkFastPath } from './fast-path';
+import { looksLikeProfileQuestion } from './website-profile-fast-path';
 import { getToolsForSurface } from '../tools/registry';
 import { runToolLoop, ToolCallLog } from '../tools/runner';
 import { logger } from '../utils/logger';
@@ -69,6 +72,10 @@ const LLM_TIMEOUT_MS = 50000;
 // safely under the backend's own axios proxy timeout to /api/chat (raised to
 // 100s for this path — see ai.routes.ts).
 const TOOL_LOOP_TIMEOUT_MS = 90000;
+// maybeCaptureWidgetLead() runs fire-and-forget (see its call sites below) —
+// this timeout is defense-in-depth only, since nothing awaits this call
+// anymore, but it still stops a hung request from lingering indefinitely.
+const LEAD_EXTRACTION_TIMEOUT_MS = 15000;
 
 function shouldEscalate(response: string, userMessage: string): boolean {
   const responseLower = response.toLowerCase();
@@ -135,15 +142,19 @@ async function maybeCaptureWidgetLead(
     // burning tokens on every turn of an already-qualified conversation.
     if (!state.firstName || (!state.email && !state.phone)) {
       try {
-        const extraction = await llm.generateStructured(
-          [
-            {
-              role: 'system',
-              content: 'Extract the visitor\'s first name, last name, email, phone, and company from their message below, if mentioned. Use null for anything not present — do not guess or fabricate.',
-            },
-            { role: 'user', content: input.message },
-          ],
-          LeadFieldExtractionSchema,
+        const extraction = await withTimeout(
+          llm.generateStructured(
+            [
+              {
+                role: 'system',
+                content: 'Extract the visitor\'s first name, last name, email, phone, company, and the service/reason they\'re contacting about, from their message below, if mentioned. Use null for anything not present — do not guess or fabricate.',
+              },
+              { role: 'user', content: input.message },
+            ],
+            LeadFieldExtractionSchema,
+          ),
+          LEAD_EXTRACTION_TIMEOUT_MS,
+          'Widget lead-field extraction',
         );
         // cleanArg() guards against Groq's occasional literal-string "null"
         // (instead of real JSON null) for a field it doesn't know — without
@@ -156,11 +167,13 @@ async function maybeCaptureWidgetLead(
         const cEmail = cleanArg(extraction.email ?? undefined);
         const cPhone = cleanArg(extraction.phone ?? undefined);
         const cCompany = cleanArg(extraction.company ?? undefined);
+        const cService = cleanArg(extraction.service ?? undefined);
         if (cFirst && !state.firstName)   state.firstName = cFirst;
         if (cLast && !state.lastName)     state.lastName  = cLast;
         if (cEmail && !state.email)       state.email     = cEmail;
         if (cPhone && !state.phone)       state.phone     = cPhone;
         if (cCompany && !state.company)   state.company   = cCompany;
+        if (cService && !state.service)   state.service   = cService;
       } catch (err) {
         logger.warn('Widget lead-field structured extraction failed', {
           sessionId: input.sessionId, error: (err as Error).message,
@@ -181,6 +194,7 @@ async function maybeCaptureWidgetLead(
         email:     state.email,
         phone:     state.phone,
         company:   state.company,
+        service:   state.service,
       });
       if (result.success && result.leadId) {
         state.leadCreated = true;
@@ -217,6 +231,20 @@ const CRM_DATA_KEYWORDS = [
   'amount', 'total', 'discount', 'quantity', 'tax', 'rate', 'stock', 'inventory',
   'history', 'deal', 'pipeline', 'stage', 'status', 'report',
 ];
+
+// A cheap, narrowing-only signal that a turn is booking-shaped — used to
+// skip binding catalog/RAG tools on that turn. Plain substring matching, so
+// it can false-positive on words like "notebook"/"textbook"; the worst case
+// is one turn where booking tools are bound instead of the ones actually
+// needed, never a broken booking flow, so this is accepted as-is.
+const BOOKING_ONLY_SIGNALS = [
+  'appointment', 'book', 'schedule', 'slot', 'available time', 'meeting',
+];
+
+function isBookingOnlyMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return BOOKING_ONLY_SIGNALS.some((s) => lower.includes(s));
+}
 
 // Channel names the user might type in a message
 const CHANNEL_ALIASES: Record<string, string[]> = {
@@ -746,6 +774,59 @@ function formatQnAContext(pairs: Array<{ question: string; answer: string; categ
   return lines.join('\n');
 }
 
+/** Lets the LLM answer naturally-phrased variants of "tell me about this
+ * website"/location/hours/services/staff questions that website-profile-
+ * fast-path.ts's literal pattern-match didn't catch — with zero tool call
+ * involved, same "always-on injected context" shape as formatQnAContext
+ * above. Only built when a profile actually exists (a never-crawled tenant
+ * costs nothing extra). */
+function formatWebsiteProfileContext(profile: import('../services/backend.client').WebsiteProfileSummary): string {
+  const lines = ['=== BUSINESS PROFILE (from this tenant\'s own crawled website) ==='];
+  if (profile.summary) lines.push(`Summary: ${profile.summary}`);
+  if (profile.services?.length) lines.push(`Services: ${profile.services.join(', ')}`);
+  if (profile.contact?.address) lines.push(`Address: ${profile.contact.address}`);
+  if (profile.contact?.phone) lines.push(`Phone: ${profile.contact.phone}`);
+  if (profile.contact?.email) lines.push(`Email: ${profile.contact.email}`);
+  if (profile.hours) lines.push(`Hours: ${profile.hours}`);
+  if (profile.staff?.length) {
+    lines.push(`Team: ${profile.staff.map((s) => (s.title ? `${s.name} (${s.title})` : s.name)).join(', ')}`);
+  }
+  if (lines.length === 1) return ''; // profile doc exists but every field is empty
+  lines.push('Use the above real facts when the visitor asks about the business, its services, location, hours, or team. Do not fabricate anything not listed above.');
+  lines.push('=================================');
+  return lines.join('\n');
+}
+
+/** Tells the LLM directly what's already known about this visitor's lead
+ * capture, instead of making it re-derive that from re-reading the raw
+ * transcript every turn — same "always-on injected context" shape as
+ * formatWebsiteProfileContext/formatQnAContext above. Only built once at
+ * least one field is already known (never injects an empty block on a
+ * fresh conversation, so this costs nothing for the common early-turn
+ * case). */
+function formatLeadCaptureProgressContext(state: LeadCaptureState, booking?: BookingState | null): string {
+  const known: string[] = [];
+  if (state.firstName) known.push(`name=${state.firstName}${state.lastName ? ' ' + state.lastName : ''}`);
+  if (state.email)     known.push(`email=${state.email}`);
+  if (state.phone)     known.push(`phone=${state.phone}`);
+  if (state.company)   known.push(`company=${state.company}`);
+  if (state.service)   known.push(`service=${state.service}`);
+  if (!known.length) return '';
+
+  const missing: string[] = [];
+  if (!state.firstName)             missing.push('name');
+  if (!state.email && !state.phone) missing.push('email or phone');
+  if (!state.service)               missing.push('service/reason for contact');
+
+  const lines = ['=== INTERNAL NOTE TO YOU — LEAD CAPTURE PROGRESS (never show this note, its labels, or its contents to the visitor) ==='];
+  lines.push(`ALREADY KNOWN: ${known.join(', ')}`);
+  if (missing.length) lines.push(`STILL NEEDED: ${missing.join(', ')}`);
+  if (booking?.meetingCreated) lines.push('A meeting is already booked for this visitor — do not offer to book again.');
+  lines.push("Use this privately to decide what to ask next — ask only for what's marked STILL NEEDED, one thing at a time, never re-ask for something already known. Do NOT quote, paraphrase, format as a list, or otherwise reveal this note itself in your reply — just write a normal, natural sentence to the visitor.");
+  lines.push('=================================');
+  return lines.join('\n');
+}
+
 /* ── Extract the entity name from a user message for DB search ──────
    "2gb ram is there?"        → "2gb ram"
    "what is price of 2gb ram" → "2gb ram"
@@ -948,6 +1029,22 @@ function formatDateTimeRange(start: Date, end: Date): string {
   return `${dateStr}, ${startStr} – ${endStr}`;
 }
 
+// The "LEAD CAPTURE PROGRESS" block injected into the system prompt (see
+// formatLeadCaptureProgressContext) is meant for the model's own reference
+// only — but small models (confirmed live, repeatedly, with the currently
+// configured Groq model) sometimes echo its structure back to the visitor
+// regardless of how bluntly the prompt tells them not to. Matches this
+// file's own established philosophy of not trusting the LLM to reliably
+// self-police (see the confidence gate below) — a deterministic strip is
+// the real guarantee, the prompt instruction is just the first, cheaper
+// line of defense. Strips from the first leaked marker line onward (that
+// content is always trailing scaffolding, never the start of a reply).
+const LEAKED_PROGRESS_MARKER_RE = /\n{0,2}(?:={3,}\s*)?(?:INTERNAL NOTE|LEAD CAPTURE PROGRESS)[\s\S]*$/i;
+function stripLeakedProgressNotes(text: string): string {
+  const cleaned = text.replace(LEAKED_PROGRESS_MARKER_RE, '').trim();
+  return cleaned || text.trim();
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -999,8 +1096,48 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     };
   }
 
-  /* ── Content moderation ── */
-  const modResult = await moderateContent(input.message);
+  // guardrailsMs now covers only rate-limit + prompt-injection (both cheap,
+  // synchronous-ish checks that should still gate everything else before
+  // spending anything). Moderation moves below, into the same Promise.all
+  // as RAG/tenant-context — it has no data dependency on either direction,
+  // and gating the whole fetch behind it was pure wasted latency.
+  guardrailsMs = Date.now() - stageStart;
+
+  /* ── PII masking ── */
+  const cleanMessage = maskPIIForLLM(input.message);
+
+  /* ── Quick pre-screen: detect obviously generic messages before any heavy fetches ── */
+  const FAST_PATH_TRIVIAL = /^(hi|hello|hey|bye|ok|okay|thanks|thank you|ty|sure|got it|how are you|what is your name|who are you|good morning|good evening|good night|night|later|goodbye|cheers|appreciate it|cool|great|perfect|noted|understood|alright|cya)\s*[!?.]*$/i;
+  const isObviouslyGeneric = FAST_PATH_TRIVIAL.test(cleanMessage.trim()) || cleanMessage.trim().length <= 3;
+
+  /* ── Fetch tenant context + run moderation concurrently — skip RAG/CRM for obviously generic messages ── */
+  const ragStart = Date.now();
+  const modStart = Date.now();
+  let moderationMs = 0;
+  const [modResult, ragResult, tenantConfig, history, prevCRMState, leadCaptureState, bookingState] = await Promise.all([
+    moderateContent(input.message).finally(() => { moderationMs = Date.now() - modStart; }),
+    isObviouslyGeneric
+      ? Promise.resolve({ context: '', topScore: 0 })
+      : buildRAGContextWithConfidence(cleanMessage, input.tenantId).catch(() => ({ context: '', topScore: 0 })).finally(() => { ragMs = Date.now() - ragStart; }),
+    resolveTenantConfig(input.tenantId, {
+      companyName: input.companyName,
+      agentName:   input.agentName,
+      language:    input.language,
+    }),
+    getHistory(input.sessionId),
+    getCRMState(input.sessionId),
+    getLeadCaptureState(input.sessionId),
+    getBookingState(input.sessionId),
+  ]);
+  const ragContext = ragResult.context;
+  const ragTopScore = ragResult.topScore;
+
+  /* ── Content moderation result — checked here, after the concurrent fetch
+     above, but still fully before anything is sent to an LLM. Disclosed
+     tradeoff: the rare unsafe-message case now also pays for the RAG/tenant/
+     history/CRM-state fetches above (previously skipped by returning early)
+     — a few wasted calls in exchange for lower latency on every normal
+     message. ── */
   if (modResult.usedFallback) {
     logger.warn('Moderation running in local-fallback mode', { tenantId: input.tenantId });
     backendClient.writeLog({
@@ -1025,50 +1162,42 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     };
   }
 
-  guardrailsMs = Date.now() - stageStart;
-
-  /* ── PII masking ── */
-  const cleanMessage = maskPIIForLLM(input.message);
-
-  /* ── Quick pre-screen: detect obviously generic messages before any heavy fetches ── */
-  const FAST_PATH_TRIVIAL = /^(hi|hello|hey|bye|ok|okay|thanks|thank you|ty|sure|got it|how are you|what is your name|who are you|good morning|good evening|good night|night|later|goodbye|cheers|appreciate it|cool|great|perfect|noted|understood|alright|cya)\s*[!?.]*$/i;
-  const isObviouslyGeneric = FAST_PATH_TRIVIAL.test(cleanMessage.trim()) || cleanMessage.trim().length <= 3;
-
-  /* ── Fetch tenant context — skip RAG/CRM for obviously generic messages ── */
-  const ragStart = Date.now();
-  const [ragResult, tenantConfig, history, prevCRMState] = await Promise.all([
-    isObviouslyGeneric
-      ? Promise.resolve({ context: '', topScore: 0 })
-      : buildRAGContextWithConfidence(cleanMessage, input.tenantId).catch(() => ({ context: '', topScore: 0 })).finally(() => { ragMs = Date.now() - ragStart; }),
-    resolveTenantConfig(input.tenantId, {
-      companyName: input.companyName,
-      agentName:   input.agentName,
-      language:    input.language,
-    }),
-    getHistory(input.sessionId),
-    getCRMState(input.sessionId),
-  ]);
-  const ragContext = ragResult.context;
-  const ragTopScore = ragResult.topScore;
-
-  /* ── Fast-path: instant responses for greetings / off-topic — zero LLM cost ── */
+  /* ── Fast-path: instant responses for greetings / off-topic — zero LLM cost.
+     Crawled FAQPage entries are merged into the same qnaPairs array fed to
+     the existing Fuse.js matcher — a crawled FAQ gets answered with zero new
+     matching code, reusing 100% existing, proven infrastructure. ── */
+  const mergedQnaPairs = tenantConfig.websiteProfile?.faqs?.length
+    ? [...tenantConfig.qnaPairs, ...tenantConfig.websiteProfile.faqs.map((f) => ({ ...f, category: 'crawled-faq' }))]
+    : tenantConfig.qnaPairs;
   const fast = checkFastPath(
     cleanMessage,
     tenantConfig.agentName,
     tenantConfig.companyName,
     tenantConfig.hasConnectors && !isPublicVisitor,
-    tenantConfig.qnaPairs,
+    mergedQnaPairs,
+    tenantConfig.websiteProfile,
   );
   if (fast.handled && fast.response) {
+    let fastResponse = fast.response;
+    // Trailing nudge — shown once per session, only after an informational
+    // (qna/profile) answer, not a greeting/farewell/off-topic reply, which
+    // already has its own closing framing. Public widget only.
+    if (isPublicVisitor && (fast.category === 'qna' || fast.category === 'profile')) {
+      const leadState = leadCaptureState ?? {};
+      if (!leadState.nudgeShown) {
+        fastResponse += ' Would you like to book a time with our team, or is there anything else I can help with?';
+        await setLeadCaptureState(input.sessionId, { ...leadState, nudgeShown: true });
+      }
+    }
     // Persist to Redis + MongoDB so chat history is complete
     await Promise.all([
       appendMessage(input.sessionId, { role: 'user',      content: input.message,   timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: fast.response,   timestamp: Date.now() }),
+      appendMessage(input.sessionId, { role: 'assistant', content: fastResponse,   timestamp: Date.now() }),
     ]);
     backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: fast.response });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: fastResponse });
     logger.info('Fast-path response (no LLM used)', { tenantId: input.tenantId, sessionId: input.sessionId, message: cleanMessage.slice(0, 60) });
-    return { response: fast.response, escalate: false, capturedData: extractCapturedData(input.message) };
+    return { response: fastResponse, escalate: false, capturedData: extractCapturedData(input.message) };
   }
 
   /* ── Tenant token-quota gate — public widget only. Blocks the AI/LLM
@@ -1082,7 +1211,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     const quota = await checkTenantTokenQuota(input.tenantId, tenantConfig.monthlyTokenLimit);
     if (quota.blocked) {
       const capturedNow = extractCapturedData(input.message);
-      await maybeCaptureWidgetLead(input, capturedNow);
+      void maybeCaptureWidgetLead(input, capturedNow);
       const reply = "Thanks for reaching out! Our AI assistant has reached its usage limit for now — please leave your name and email or phone number and our team will get back to you personally.";
       await Promise.all([
         appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
@@ -1827,7 +1956,21 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
         'check_meeting_availability (get REAL open times — never guess or invent times yourself),',
         'and book_meeting (confirm a booking on one of the times check_meeting_availability just returned).',
         'When a tool returns real data, base your reply directly on that data — do not ignore it or ask a generic clarifying question instead.',
+        'After answering a factual question, naturally suggest a next step (booking a time, or asking if there\'s anything else) — without being pushy or repeating it if you already have.',
+        ...(tenantConfig.hasWidgetDepartments
+          ? [
+              'This business has multiple departments/doctors. Before checking availability for a booking, call list_departments first.',
+              'If it returns real departments, ask the visitor which one, then call list_doctors for that department, ask which doctor they\'d like,',
+              'and pass that doctor\'s staffId into check_meeting_availability and book_meeting. If list_departments returns none, proceed exactly as normal.',
+            ]
+          : []),
       ].join(' ');
+      if (tenantConfig.websiteProfile) {
+        const profileBlock = formatWebsiteProfileContext(tenantConfig.websiteProfile);
+        if (profileBlock) systemContent += '\n\n' + profileBlock;
+      }
+      const progressBlock = formatLeadCaptureProgressContext(leadCaptureState ?? {}, bookingState);
+      if (progressBlock) systemContent += '\n\n' + progressBlock;
     }
   }
 
@@ -1848,7 +1991,8 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
      internal_staff has zero tools in this phase, so this is always the
      plain llm.generate() path for the existing internal assistant — no
      behavior change there. ── */
-  const surfaceTools = getToolsForSurface(isPublicVisitor ? 'public_widget' : 'internal_staff');
+  const bookingOnly = isPublicVisitor && isBookingOnlyMessage(cleanMessage);
+  const surfaceTools = getToolsForSurface(isPublicVisitor ? 'public_widget' : 'internal_staff', { bookingOnly });
   let toolCallsLog: ToolCallLog[] = [];
   let responseUsage: UsageMetadata | undefined;
   const llmStart = Date.now();
@@ -1871,6 +2015,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
             companyName: tenantConfig.companyName,
             timezone: 'UTC',
           },
+          toolModelOverride: tenantConfig.toolModelPreset ? TOOL_MODEL_PRESETS[tenantConfig.toolModelPreset] : undefined,
         }),
         TOOL_LOOP_TIMEOUT_MS,
         'LLM tool loop'
@@ -1890,7 +2035,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
 
     const llmMs = Date.now() - llmStart;
     const result = { content: responseContent, provider: responseProvider, model: responseModel };
-    let response = result.content;
+    let response = stripLeakedProgressNotes(result.content);
     const estimatedCost = responseUsage
       ? estimateCostUsd(result.provider, result.model, responseUsage.input_tokens, responseUsage.output_tokens)
       : undefined;
@@ -1914,8 +2059,23 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
        either, override it with a human-handoff message — which also
        contains "connect you with", so the existing shouldEscalate() below
        picks it up automatically, with no separate escalation code needed. ── */
-    const attemptedGrounding = ragTopScore > 0 || toolCallsLog.length > 0;
-    const { source: responseSource, confidence: responseConfidence } = classifyResponseConfidence(ragTopScore, toolCallsLog);
+    // Did this look like a profile-shaped question ("tell me about this
+    // website", "where are you located"...) AND does the tenant actually
+    // have real, non-empty profile data — the case where the LLM answered
+    // via formatWebsiteProfileContext's always-on injection above rather
+    // than a tool call, so toolCallsLog alone wouldn't reveal it.
+    const hasNonEmptyProfile = !!tenantConfig.websiteProfile && Object.values(tenantConfig.websiteProfile).some(
+      (v) => (Array.isArray(v) ? v.length > 0 : v && typeof v === 'object' ? Object.keys(v).length > 0 : !!v)
+    );
+    const isProfileShapedQuestion = looksLikeProfileQuestion(cleanMessage);
+    const hasProfileMatch = hasNonEmptyProfile && isProfileShapedQuestion;
+    // A profile-shaped question counts as "attempted grounding" even when it
+    // scored zero RAG similarity and called no tool — otherwise a never-
+    // crawled tenant asked "tell me about your business" skips this gate
+    // entirely (no score, no tool call) and the LLM free-associates using
+    // only companyName instead of admitting it doesn't know yet.
+    const attemptedGrounding = ragTopScore > 0 || toolCallsLog.length > 0 || isProfileShapedQuestion;
+    const { source: responseSource, confidence: responseConfidence } = classifyResponseConfidence(ragTopScore, toolCallsLog, hasProfileMatch);
     if (isPublicVisitor && attemptedGrounding && responseConfidence < CONFIDENCE_THRESHOLD) {
       response = "That's a good question, but I don't have a confident answer from our records — let me connect you with our team so they can help directly. Could I get your name and best way to reach you?";
     }
@@ -1969,7 +2129,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
         completionTokens: responseUsage?.output_tokens,
         totalTokens:      responseUsage?.total_tokens,
         estimatedCostUsd: estimatedCost,
-        stageTimingsMs:   { guardrails: guardrailsMs, rag: ragMs, llm: llmMs },
+        stageTimingsMs:   { guardrails: guardrailsMs, moderation: moderationMs, rag: ragMs, llm: llmMs },
         responseSource:     attemptedGrounding ? responseSource : undefined,
         responseConfidence: attemptedGrounding ? responseConfidence : undefined,
       },
@@ -2035,7 +2195,13 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     } catch { /* logging must never crash the agent */ }
     // ─────────────────────────────────────────────────────────────────────
 
-    await maybeCaptureWidgetLead(input, capturedNow);
+    // Fire-and-forget — the visible reply text above is already fully
+    // computed and persisted by this point, so this background bookkeeping
+    // step cannot change what the visitor sees this turn. Matches this
+    // file's own established fire-and-forget idiom (void fn(), see
+    // logAIAction above), rather than blocking the HTTP response on an
+    // extra LLM call the visitor gets no benefit from waiting on.
+    void maybeCaptureWidgetLead(input, capturedNow);
 
     return { response, escalate, capturedData };
   } catch (err) {

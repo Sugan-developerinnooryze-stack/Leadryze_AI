@@ -1,6 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import { getCachedTenantContext, setCachedTenantContext } from '../memory/conversation.memory';
 
 /* ── Types matching the backend's internal endpoint response ── */
 export interface TenantAIConfig {
@@ -9,6 +10,11 @@ export interface TenantAIConfig {
   fallbackToHuman?: boolean;
   agentName?: string;
   monthlyTokenLimit?: number;
+  /** Which already-integrated LLM provider/model powers RAG/catalog/booking
+   * tool-calling for this tenant specifically — undefined means "use the
+   * global primary/fallback pair", today's unchanged default. See
+   * config/index.ts's TOOL_MODEL_PRESETS for what each preset resolves to. */
+  toolModelPreset?: 'groq' | 'anthropic' | 'openai' | 'google';
 }
 
 export interface TenantBranding {
@@ -80,6 +86,18 @@ export interface InlineRecord {
   data: Record<string, unknown>;
 }
 
+/** Built once per website crawl (ai/src/rag/website-profile-extractor.ts),
+ * not per-question — see website-profile-fast-path.ts / base.agent.ts's
+ * formatWebsiteProfileContext() for how this gets used in a live turn. */
+export interface WebsiteProfileSummary {
+  summary?: string;
+  services?: string[];
+  contact?: { phone?: string; email?: string; address?: string };
+  hours?: string;
+  staff?: Array<{ name: string; title?: string }>;
+  faqs?: Array<{ question: string; answer: string }>;
+}
+
 export interface TenantContext {
   tenant: {
     id: string;
@@ -96,7 +114,12 @@ export interface TenantContext {
   inlineRecords: Record<string, InlineRecord[]>;
   templates: TemplateSummary[];
   qnaPairs: QnAPairSummary[];
+  websiteProfile: WebsiteProfileSummary | null;
+  hasWidgetDepartments: boolean;
 }
+
+export interface WidgetTeamSummary { teamId: string; name: string; }
+export interface WidgetStaffSummary { staffId: string; name: string; }
 
 export interface CRMRecord {
   externalId: string;
@@ -128,11 +151,15 @@ class BackendClient {
   }
 
   async getTenantContext(tenantId: string): Promise<TenantContext | null> {
+    const cached = await getCachedTenantContext<TenantContext>(tenantId);
+    if (cached) return cached;
     try {
       const res = await this.http.get<{ data: TenantContext }>(
         `/api/internal/tenant-context/${tenantId}`
       );
-      return res.data.data;
+      const ctx = res.data.data;
+      void setCachedTenantContext(tenantId, ctx);
+      return ctx;
     } catch (err) {
       logger.warn('BackendClient: could not fetch tenant context', {
         tenantId,
@@ -321,6 +348,16 @@ class BackendClient {
     }
   }
 
+  async upsertWebsiteProfileFromCrawl(
+    tenantId: string, knowledgeSourceId: string, fields: Record<string, unknown>
+  ): Promise<void> {
+    try {
+      await this.http.post('/api/internal/website-profile/upsert-from-crawl', { tenantId, knowledgeSourceId, fields });
+    } catch (err) {
+      logger.warn('BackendClient: upsertWebsiteProfileFromCrawl failed', { error: (err as Error).message, tenantId });
+    }
+  }
+
   /** Send an email via the backend message service. */
   async sendEmail(params: {
     tenantId: string; toEmail: string; toName?: string;
@@ -447,7 +484,7 @@ class BackendClient {
    * widget conversation turns into a real CRM record. */
   async createLeadFromWidget(params: {
     tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
-    firstName: string; lastName?: string; email?: string; phone?: string; company?: string;
+    firstName: string; lastName?: string; email?: string; phone?: string; company?: string; service?: string;
   }): Promise<{ success: boolean; leadId?: string; leadDisplayId?: string; alreadyCreated?: boolean }> {
     try {
       const res = await this.http.post<{ data: { leadId: string; leadDisplayId?: string; alreadyCreated?: boolean } }>(
@@ -477,9 +514,11 @@ class BackendClient {
 
   /** Real, tenant-wide business-hours availability for the widget's booking
    * tool — see the backend's availability.service.ts for the single-capacity
-   * model (no per-staff calendars exist anywhere in this codebase). */
+   * model (no per-staff calendars exist anywhere in this codebase). An
+   * optional staffId narrows this to one chosen doctor's own availability,
+   * for tenants using the department/doctor booking wizard. */
   async getWidgetAvailability(
-    tenantId: string, opts: { days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any' } = {}
+    tenantId: string, opts: { days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; staffId?: string } = {}
   ): Promise<Array<{ startIso: string; endIso: string; label: string }>> {
     try {
       const res = await this.http.get<{ data: { slots: Array<{ startIso: string; endIso: string; label: string }> } }>(
@@ -492,15 +531,44 @@ class BackendClient {
     }
   }
 
+  /** Departments (Teams marked showInWidget:true) a visitor may choose
+   * between when booking. Empty result reads as "no departments configured"
+   * — proceed straight to availability, not an error. */
+  async getWidgetTeams(tenantId: string): Promise<Array<{ teamId: string; name: string }>> {
+    try {
+      const res = await this.http.get<{ data: { teams: Array<{ teamId: string; name: string }> } }>(
+        '/api/internal/widget-teams', { params: { tenantId } },
+      );
+      return res.data.data?.teams ?? [];
+    } catch (err) {
+      logger.warn('BackendClient: getWidgetTeams failed', { error: (err as Error).message, tenantId });
+      return [];
+    }
+  }
+
+  /** Active staff (doctors) within one chosen department. */
+  async getWidgetStaff(tenantId: string, teamId: string): Promise<Array<{ staffId: string; name: string }>> {
+    try {
+      const res = await this.http.get<{ data: { staff: Array<{ staffId: string; name: string }> } }>(
+        '/api/internal/widget-staff', { params: { tenantId, teamId } },
+      );
+      return res.data.data?.staff ?? [];
+    } catch (err) {
+      logger.warn('BackendClient: getWidgetStaff failed', { error: (err as Error).message, tenantId });
+      return [];
+    }
+  }
+
   /** Converts an offered slot into a real Lead + Meeting — see the backend's
    * own /api/internal/widget-book-meeting for the full orchestration
-   * (re-check availability, round-robin, captureLeadFromExternalSource,
-   * createMeeting). Never throws — a failure just means the visitor gets
-   * told the booking couldn't be completed, same posture as
-   * createLeadFromWidget() above. */
+   * (re-check availability, round-robin or a chosen doctor,
+   * captureLeadFromExternalSource, createMeeting). Never throws — a failure
+   * just means the visitor gets told the booking couldn't be completed, same
+   * posture as createLeadFromWidget() above. */
   async bookWidgetMeeting(params: {
     tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
     startIso: string; endIso: string; firstName: string; lastName?: string; email?: string; phone?: string; topic?: string;
+    staffId?: string;
   }): Promise<{ success: boolean; meetingId?: string; staffName?: string; leadId?: string; alreadyCreated?: boolean; error?: string }> {
     try {
       const res = await this.http.post<{ data: { meetingId: string; staffName?: string; leadId: string; alreadyCreated?: boolean } }>(

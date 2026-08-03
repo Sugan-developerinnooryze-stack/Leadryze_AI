@@ -1,4 +1,4 @@
-import { backendClient, TenantContext, InlineRecord } from './backend.client';
+import { backendClient, TenantContext, InlineRecord, WebsiteProfileSummary } from './backend.client';
 import { logger } from '../utils/logger';
 
 export interface ResolvedTenantConfig {
@@ -15,11 +15,24 @@ export interface ResolvedTenantConfig {
   crmModules: Record<string, Array<{ module: string; count: number }>>;
   qnaPairs: Array<{ question: string; answer: string; category: string }>;
   templates: Array<{ name: string; type: string; category: string; subject?: string; body: string; variables: string[] }>;
+  /** Built once per crawl (ai/src/rag/website-profile-extractor.ts) — null
+   * for a tenant that's never crawled their site. */
+  websiteProfile: WebsiteProfileSummary | null;
   /** Monthly LLM token budget for the public widget only (never applies to
    * the internal, staff-authenticated assistant — see isPublicVisitor in
    * base.agent.ts). Always a real number — a plan-tier default when the
    * tenant has no explicit aiConfig.monthlyTokenLimit override. */
   monthlyTokenLimit: number;
+  /** Which already-integrated LLM provider/model powers RAG/catalog/booking
+   * tool-calling for this tenant — undefined means "use the global primary/
+   * fallback pair", today's unchanged default. */
+  toolModelPreset?: 'groq' | 'anthropic' | 'openai' | 'google';
+  /** True when this tenant has at least one active Team marked
+   * showInWidget:true — gates whether the booking prompt ever mentions
+   * departments/doctors at all. False for every tenant that hasn't opted
+   * into the department/doctor wizard, so today's tenant-wide booking flow
+   * stays completely unaffected. */
+  hasWidgetDepartments: boolean;
 }
 
 /** Plan-tier default monthly token budgets — deliberately generous
@@ -182,7 +195,9 @@ export async function resolveTenantConfig(
       crmModules: {},
       qnaPairs: [],
       templates: [],
+      websiteProfile: null,
       monthlyTokenLimit: DEFAULT_MONTHLY_TOKEN_LIMITS.starter,
+      hasWidgetDepartments: false,
     };
   }
 
@@ -200,8 +215,11 @@ export async function resolveTenantConfig(
     crmModules: ctx.crmModules,
     qnaPairs: ctx.qnaPairs || [],
     templates: ctx.templates || [],
+    websiteProfile: ctx.websiteProfile ?? null,
     monthlyTokenLimit: ctx.tenant.aiConfig?.monthlyTokenLimit
       ?? DEFAULT_MONTHLY_TOKEN_LIMITS[ctx.tenant.plan]
       ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter,
+    toolModelPreset: ctx.tenant.aiConfig?.toolModelPreset,
+    hasWidgetDepartments: ctx.hasWidgetDepartments ?? false,
   };
 }

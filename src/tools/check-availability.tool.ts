@@ -1,12 +1,14 @@
 import { z } from 'zod';
 import { AgentTool } from './tool.types';
 import { backendClient } from '../services/backend.client';
-import { setBookingState } from '../memory/conversation.memory';
+import { cleanArg } from '../utils/clean-arg';
+import { getBookingState, setBookingState } from '../memory/conversation.memory';
 
 const schema = z.object({
   preferredDate: z.string().optional().describe('A specific date the visitor asked about, as YYYY-MM-DD, if any'),
   timeOfDay: z.enum(['morning', 'afternoon', 'any']).optional().describe('Narrows to morning or afternoon slots if the visitor asked for one'),
   days: z.number().int().min(1).max(30).optional().describe('How many days out to look — defaults to the tenant\'s own booking horizon'),
+  staffId: z.string().optional().describe('The exact staffId of the doctor the visitor chose from list_doctors, if this business has departments — omit otherwise'),
 });
 
 export const checkMeetingAvailabilityTool: AgentTool<z.infer<typeof schema>> = {
@@ -17,7 +19,10 @@ export const checkMeetingAvailabilityTool: AgentTool<z.infer<typeof schema>> = {
   schema,
   surfaces: ['public_widget'],
   async execute(args, ctx) {
-    const slots = await backendClient.getWidgetAvailability(ctx.tenantId, { days: args.days, timeOfDay: args.timeOfDay });
+    const booking = (await getBookingState(ctx.sessionId)) ?? {};
+    const staffId = cleanArg(args.staffId) || booking.selectedStaffId;
+
+    const slots = await backendClient.getWidgetAvailability(ctx.tenantId, { days: args.days, timeOfDay: args.timeOfDay, staffId });
     if (!slots.length) {
       return { ok: true, summary: 'No available meeting times were found — booking may not be enabled for this business, or nothing is free in the horizon checked.' };
     }
@@ -27,7 +32,12 @@ export const checkMeetingAvailabilityTool: AgentTool<z.infer<typeof schema>> = {
       : slots;
     const shown = (filtered.length ? filtered : slots).slice(0, 5);
 
-    await setBookingState(ctx.sessionId, { offeredSlots: shown.map((s) => ({ startIso: s.startIso, endIso: s.endIso })), offeredAt: Date.now() });
+    await setBookingState(ctx.sessionId, {
+      ...booking,
+      selectedStaffId: staffId || booking.selectedStaffId,
+      offeredSlots: shown.map((s) => ({ startIso: s.startIso, endIso: s.endIso })),
+      offeredAt: Date.now(),
+    });
 
     return {
       ok: true,

@@ -12,6 +12,9 @@ export const LeadFieldExtractionSchema = z.object({
   email:     z.string().nullable(),
   phone:     z.string().nullable(),
   company:   z.string().nullable(),
+  /** What they're contacting about / interested in — maps onto
+   * Lead.interestedServices on the backend. */
+  service:   z.string().nullable(),
   confidence: z.number().min(0).max(1),
 });
 

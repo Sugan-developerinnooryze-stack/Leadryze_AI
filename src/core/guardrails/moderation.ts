@@ -3,7 +3,13 @@ import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { localModerationFallback } from './local-moderation-fallback';
 
-const openai = new OpenAI({ apiKey: config.openai.apiKey });
+// Explicit timeout + zero retries: without these, the SDK's own defaults
+// (maxRetries:2 with backoff) mean a 429 from OpenAI's moderation endpoint
+// burns several seconds retrying INSIDE this call before the catch block
+// below ever gets a chance to fall back locally — confirmed live during an
+// actual, sustained moderation-API outage this project hit. Failing fast
+// here is what makes the local fallback actually fast.
+const openai = new OpenAI({ apiKey: config.openai.apiKey, timeout: 6000, maxRetries: 0 });
 
 export interface ModerationResult {
   safe: boolean;

@@ -89,6 +89,22 @@ export const config = {
   },
 };
 
+/** Per-tenant tool-model selection (Tenant.aiConfig.toolModelPreset) —
+ * governs only the RAG/catalog/booking tool-calling path (invokeWithTools()/
+ * runToolLoop()), never the plain fast-path/conversational/lead-extraction
+ * paths, which keep using config.llm's own primary/fallback pair above
+ * unchanged. Each preset resolves to a provider+model pair already used
+ * somewhere in this codebase — no new model names invented. The 'openai'
+ * preset is labeled "GPT-4o mini" in the UI (not "GPT-4.1", which isn't a
+ * model string that exists anywhere in this codebase) since gpt-4o-mini is
+ * the only OpenAI model literal already present. */
+export const TOOL_MODEL_PRESETS: Record<'groq' | 'anthropic' | 'openai' | 'google', { provider: string; model: string }> = {
+  groq:      { provider: 'groq',      model: config.llm.provider === 'groq'      ? config.llm.model : (config.llm.fallbackProvider === 'groq'      ? config.llm.fallbackModel : 'llama-3.1-8b-instant') },
+  google:    { provider: 'gemini',    model: config.llm.provider === 'gemini'    ? config.llm.model : (config.llm.fallbackProvider === 'gemini'    ? config.llm.fallbackModel : 'gemini-2.0-flash-lite') },
+  anthropic: { provider: 'anthropic', model: config.llm.provider === 'anthropic' ? config.llm.model : (config.llm.fallbackProvider === 'anthropic' ? config.llm.fallbackModel : 'claude-haiku-4-5-20251001') },
+  openai:    { provider: 'openai',    model: config.llm.provider === 'openai'    ? config.llm.model : (config.llm.fallbackProvider === 'openai'    ? config.llm.fallbackModel : 'gpt-4o-mini') },
+};
+
 if (config.app.env === 'production') {
   const aiInsecureChecks: Array<[string, string, string]> = [
     ['INTERNAL_API_KEY',     config.app.internalApiKey,         'internal-key'],

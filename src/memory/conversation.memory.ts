@@ -176,8 +176,16 @@ export interface LeadCaptureState {
   email?:     string;
   phone?:     string;
   company?:   string;
+  /** The visitor's stated reason for contacting/what they're interested in
+   * — maps onto Lead.interestedServices on the backend. Merged additively,
+   * same non-destructive rule as every other field here. */
+  service?:   string;
   leadCreated?: boolean;
   leadId?:      string;
+  /** Has the "want to book a time, or anything else?" trailing nudge
+   * already been shown this session — shown once, not appended to every
+   * informational answer, to avoid feeling repetitive. */
+  nudgeShown?: boolean;
 }
 
 export async function getLeadCaptureState(sessionId: string): Promise<LeadCaptureState | null> {
@@ -207,6 +215,15 @@ export interface BookingState {
   offeredAt?: number;
   meetingCreated?: boolean;
   meetingId?: string;
+  /** Department/doctor wizard selections, carried across turns the same way
+   * every other BookingState field already is — set once list_departments/
+   * list_doctors are called, then merged into check_meeting_availability/
+   * book_meeting's own staffId args the same cleanArg(args.X) || state.X
+   * pattern already used for name/email/phone. */
+  selectedTeamId?: string;
+  selectedTeamName?: string;
+  selectedStaffId?: string;
+  selectedStaffName?: string;
 }
 
 export async function getBookingState(sessionId: string): Promise<BookingState | null> {
@@ -223,6 +240,40 @@ export async function setBookingState(sessionId: string, state: BookingState): P
   if (!client) return;
   try {
     await client.setex(`chat:booking:${sessionId}`, TTL, JSON.stringify(state));
+  } catch { /* non-critical */ }
+}
+
+/** Short-TTL cache for the backend's /api/internal/tenant-context/:tenantId
+ * response (8 Mongo queries on the backend side) — fetched fresh on every
+ * single visitor message today with no caching at all. There is deliberately
+ * no cross-service invalidation here (the backend, where a tenant admin's
+ * save actually happens, has no way to reach into this service's Redis
+ * without new cross-service coupling — confirmed backend/ and ai/ use
+ * different Upstash credentials, not provably the same keyspace) — a real,
+ * disclosed tradeoff: any tenant config change (settings, a website crawl,
+ * a catalog import, a tool-model preset change) can take up to this many
+ * seconds to actually take effect. 10s keeps that window small enough to be
+ * a non-issue for a real admin testing their own change, while still
+ * absorbing most of a real visitor conversation's own back-and-forth
+ * (messages seconds apart) on one cache hit. Only successful fetches get
+ * cached (the caller never passes a null/failed result in), so a transient
+ * backend outage can't poison the cache for the TTL window. */
+const TENANT_CONTEXT_CACHE_TTL = 10;
+
+export async function getCachedTenantContext<T = unknown>(tenantId: string): Promise<T | null> {
+  const client = getRedis();
+  if (!client) return null;
+  try {
+    const raw = await client.get(`ai:tenantctx:${tenantId}`);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch { return null; }
+}
+
+export async function setCachedTenantContext(tenantId: string, context: unknown): Promise<void> {
+  const client = getRedis();
+  if (!client) return;
+  try {
+    await client.setex(`ai:tenantctx:${tenantId}`, TENANT_CONTEXT_CACHE_TTL, JSON.stringify(context));
   } catch { /* non-critical */ }
 }
 

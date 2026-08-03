@@ -4,10 +4,17 @@
  */
 
 import Fuse from 'fuse.js';
+import { checkWebsiteProfileFastPath } from './website-profile-fast-path';
+import type { WebsiteProfileSummary } from '../services/backend.client';
 
 export interface FastPathResult {
   handled: boolean;
   response?: string;
+  /** Which branch fired — only 'qna'/'profile' answers are eligible for the
+   * trailing "want to book / anything else" nudge (base.agent.ts); a
+   * greeting/farewell/off-topic reply already has its own closing framing
+   * and shouldn't get a second one bolted on. */
+  category?: 'qna' | 'profile' | 'other';
 }
 
 export interface QnAPairInput {
@@ -106,6 +113,7 @@ export function checkFastPath(
   companyName: string,
   hasConnectors: boolean,
   qnaPairs: QnAPairInput[] = [],
+  websiteProfile: WebsiteProfileSummary | null = null,
 ): FastPathResult {
   const n = normalise(message);
 
@@ -144,11 +152,20 @@ export function checkFastPath(
     };
   }
 
-  /* ── Tenant's own FAQ (QnAPair) — real business answer, zero LLM cost ── */
+  /* ── Tenant's own FAQ (QnAPair) — real business answer, zero LLM cost.
+   * qnaPairs already includes any crawled FAQPage entries by the time this
+   * runs (merged at the base.agent.ts call site), so a crawled FAQ gets
+   * answered via this exact same matcher — no separate matching code. ── */
   const qnaMatch = matchQnAPair(message, qnaPairs);
   if (qnaMatch) {
-    return { handled: true, response: qnaMatch.answer };
+    return { handled: true, response: qnaMatch.answer, category: 'qna' };
   }
+
+  /* ── Website Profile — "tell me about this website"/location/hours/
+   * services/staff. Only fires if the tenant has a crawled profile AND the
+   * matching field actually has data — never match-then-apologize. ── */
+  const profileMatch = checkWebsiteProfileFastPath(message, websiteProfile);
+  if (profileMatch.handled) return { ...profileMatch, category: 'profile' };
 
   /* ── How are you ── */
   if (HOW_ARE_YOU_PATTERNS.some((p) => n.includes(p))) {

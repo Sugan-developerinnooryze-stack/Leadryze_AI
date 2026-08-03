@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { crawlWebsite } from './web-crawler';
 import { ingestKnowledge, deleteKnowledge } from './pipeline';
+import { buildWebsiteProfile } from './website-profile-extractor';
 import { setCrawlStatus } from '../memory/conversation.memory';
 import { backendClient } from '../services/backend.client';
 import { logger } from '../utils/logger';
@@ -91,6 +92,19 @@ export async function ingestWebsite(opts: {
             await backendClient.upsertCatalogItemFromCrawl(tenantId, knowledgeSourceId, page.url, mapped).catch(() => {});
           }
         }
+      }
+    }
+
+    // Website Profile — one structured "who we are" doc per tenant, built
+    // once per crawl from the SAME already-crawled pages (zero new network
+    // calls). Failure here never fails the crawl, same posture as the
+    // Product-catalog upsert above.
+    if (knowledgeSourceId) {
+      try {
+        const profileFields = await buildWebsiteProfile(pages);
+        await backendClient.upsertWebsiteProfileFromCrawl(tenantId, knowledgeSourceId, profileFields as unknown as Record<string, unknown>);
+      } catch (err) {
+        logger.warn('Website profile build failed', { tenantId, startUrl, error: (err as Error).message });
       }
     }
 

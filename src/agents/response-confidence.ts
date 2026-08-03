@@ -11,7 +11,7 @@ import type { ToolCallLog } from '../tools/runner';
  * score clear a real bar — and decides from those instead.
  */
 export interface ConfidenceResult {
-  source: 'product_catalog' | 'booking' | 'website_rag' | 'general';
+  source: 'product_catalog' | 'booking' | 'business_profile' | 'website_rag' | 'general';
   confidence: number;
 }
 
@@ -23,12 +23,22 @@ export const CONFIDENCE_THRESHOLD = 0.55;
 
 export function classifyResponseConfidence(
   ragTopScore: number,
-  toolCallsLog: ToolCallLog[]
+  toolCallsLog: ToolCallLog[],
+  hasProfileMatch: boolean = false
 ): ConfidenceResult {
   const productHit = toolCallsLog.find(
     (t) => (t.name === 'search_products' || t.name === 'get_product_details') && t.ok && t.data
   );
   if (productHit) return { source: 'product_catalog', confidence: 0.9 };
+
+  // The visitor asked a profile-shaped question ("tell me about this
+  // website", "where are you located"...) AND the tenant has real, crawled
+  // profile data to answer it with — checked BEFORE the ambient RAG score
+  // below, for the exact same reason the booking branch above is: without
+  // this, a genuinely grounded profile answer would otherwise be overridden
+  // by an unrelated, near-zero RAG similarity score (the original bug this
+  // whole feature exists to fix, just for a different question class).
+  if (hasProfileMatch) return { source: 'business_profile', confidence: 0.85 };
 
   // A successful booking-tool call means real, structured data was found or
   // acted on (real availability, a real confirmed meeting) — same

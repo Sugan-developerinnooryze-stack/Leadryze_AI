@@ -68,13 +68,22 @@ export async function runToolLoop(opts: {
   surface: ToolSurface;
   maxIterations?: number;
   budgetMs?: number;
+  /** A tenant's chosen provider/model for tool-calling (see
+   * Tenant.aiConfig.toolModelPreset / TOOL_MODEL_PRESETS) — undefined means
+   * "use the global primary/fallback pair", today's unchanged default. Never
+   * applied to the forceFallback retry below (that always goes to the real
+   * global fallback, on purpose). */
+  toolModelOverride?: { provider: string; model: string };
 }): Promise<ToolLoopResult> {
   // Kept comfortably under the backend's own axios proxy timeout to /api/chat
   // (raised to 100s for the tool-calling path — see ai.routes.ts) — 35s of
   // iteration budget + worst-case 40s for the final unbound call
   // (primary+fallback each capped at 20s by invokeWithTools) leaves real
   // margin rather than racing that outer boundary.
-  const { messages, tools, ctx, surface, maxIterations = 3, budgetMs = 35_000 } = opts;
+  const { messages, tools, ctx, surface, maxIterations = 3, budgetMs = 35_000, toolModelOverride } = opts;
+  const overrideOpts = toolModelOverride
+    ? { overrideProvider: toolModelOverride.provider, overrideModel: toolModelOverride.model }
+    : {};
 
   const toolMap = new Map(tools.filter((t) => t.surfaces.includes(surface)).map((t) => [t.name, t]));
   const bindable = toBindableTools(Array.from(toolMap.values()));
@@ -96,7 +105,7 @@ export async function runToolLoop(opts: {
     // just tried and just failed — so this goes straight to the final
     // safety net instead of throwing past it uncaught.
     try {
-      ({ message: aiMsg, provider, model } = await llm.invokeWithTools(lcMessages, bindable));
+      ({ message: aiMsg, provider, model } = await llm.invokeWithTools(lcMessages, bindable, overrideOpts));
       usage = mergeUsageMetadata(usage, extractUsage(aiMsg));
       asText = contentToString(aiMsg.content);
     } catch (err) {
@@ -180,7 +189,7 @@ export async function runToolLoop(opts: {
   const HANDOFF_MESSAGE = "I'm having trouble processing that right now — let me connect you with our team so they can help directly. Could I get your name and best way to reach you?";
 
   try {
-    const { message: finalMsg, provider, model } = await llm.invokeWithTools(lcMessages, []);
+    const { message: finalMsg, provider, model } = await llm.invokeWithTools(lcMessages, [], overrideOpts);
     usage = mergeUsageMetadata(usage, extractUsage(finalMsg));
     const finalText = contentToString(finalMsg.content);
     return {

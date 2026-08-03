@@ -14,6 +14,7 @@ const schema = z.object({
   email: z.string().optional().describe('The visitor\'s email, if they just gave it'),
   phone: z.string().optional().describe('The visitor\'s phone number, if they just gave it'),
   topic: z.string().optional().describe('What they want to discuss, if mentioned'),
+  staffId: z.string().optional().describe('The exact staffId of the doctor the visitor chose from list_doctors, if this business has departments — omit otherwise'),
 });
 
 export const bookMeetingTool: AgentTool<z.infer<typeof schema>> = {
@@ -44,14 +45,20 @@ export const bookMeetingTool: AgentTool<z.infer<typeof schema>> = {
     const lastName  = cleanArg(args.lastName)  || lead.lastName;
     const email     = cleanArg(args.email)     || lead.email;
     const phone     = cleanArg(args.phone)     || lead.phone;
+    // topic merges into the same "service" signal maybeCaptureWidgetLead
+    // already tracks — a booking's stated reason shouldn't be a dead end
+    // that only lands in the Meeting's notes.
+    const topic     = cleanArg(args.topic)     || lead.service;
 
     if (!firstName || (!email && !phone)) {
       return { ok: false, summary: 'Still need the visitor\'s name and an email or phone number before this can be booked — ask for whichever is missing.' };
     }
 
+    const staffId = cleanArg(args.staffId) || booking.selectedStaffId;
+
     const result = await backendClient.bookWidgetMeeting({
       tenantId: ctx.tenantId, sessionId: ctx.sessionId, visitorId: ctx.visitorId, sourceUrl: ctx.pageUrl,
-      startIso: slot.startIso, endIso: slot.endIso, firstName, lastName, email, phone, topic: args.topic,
+      startIso: slot.startIso, endIso: slot.endIso, firstName, lastName, email, phone, topic, staffId,
     });
 
     if (!result.success) {
@@ -62,7 +69,7 @@ export const bookMeetingTool: AgentTool<z.infer<typeof schema>> = {
     // Keep LeadCaptureState in sync so maybeCaptureWidgetLead() (which runs
     // unconditionally after this) sees leadCreated:true and never attempts a
     // second, competing Lead for the same session.
-    await setLeadCaptureState(ctx.sessionId, { ...lead, firstName, lastName, email, phone, leadCreated: true, leadId: result.leadId });
+    await setLeadCaptureState(ctx.sessionId, { ...lead, firstName, lastName, email, phone, service: lead.service || topic || undefined, leadCreated: true, leadId: result.leadId });
 
     return {
       ok: true,

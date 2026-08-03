@@ -81,6 +81,20 @@ export function toLangChainMessages(messages: LLMMessage[]): BaseMessage[] {
 class ModelAbstractionLayer {
   private primary: BaseChatModel;
   private fallback: BaseChatModel;
+  // Per-tenant tool-model overrides (see TOOL_MODEL_PRESETS in config/index.ts)
+  // are constructed lazily and cached here — most requests use the global
+  // primary/fallback pair above and never touch this map at all.
+  private overrideModels = new Map<string, BaseChatModel>();
+
+  private getOverrideModel(provider: string, model: string): BaseChatModel {
+    const key = `${provider}:${model}`;
+    let m = this.overrideModels.get(key);
+    if (!m) {
+      m = createModel(provider, model);
+      this.overrideModels.set(key, m);
+    }
+    return m;
+  }
 
   constructor() {
     this.primary = createModel(config.llm.provider, config.llm.model);
@@ -183,7 +197,7 @@ class ModelAbstractionLayer {
   async invokeWithTools(
     lcMessages: BaseMessage[],
     tools: DynamicStructuredTool[],
-    opts: { forceFallback?: boolean } = {}
+    opts: { forceFallback?: boolean; overrideProvider?: string; overrideModel?: string } = {}
   ): Promise<{ message: AIMessage; provider: string; model: string }> {
     const bind = (model: BaseChatModel) =>
       typeof (model as any).bindTools === 'function' && tools.length
@@ -200,10 +214,32 @@ class ModelAbstractionLayer {
     // Used by runner.ts's retry strategy: retrying the identical primary
     // model against the identical input rarely changes a malformed-syntax
     // outcome — going straight to the fallback model is a genuine second
-    // chance, not just another roll of the same dice.
+    // chance, not just another roll of the same dice. Deliberately checked
+    // BEFORE the tenant override below — a retry after a bad response should
+    // go to the real, proven global fallback, never back through a
+    // per-tenant override that may itself be what just failed.
     if (opts.forceFallback) {
       const message = (await withCallTimeout(bind(this.fallback).invoke(lcMessages))) as AIMessage;
       return { message, provider: config.llm.fallbackProvider, model: config.llm.fallbackModel };
+    }
+
+    // Per-tenant tool-model override (Tenant.aiConfig.toolModelPreset) — a
+    // tenant opted into a specific provider/model for RAG/catalog/booking
+    // tool calls. On failure this still falls back to the real global
+    // fallback pair, so a tenant's override never removes the safety net.
+    if (opts.overrideProvider && opts.overrideModel) {
+      const overrideModel = this.getOverrideModel(opts.overrideProvider, opts.overrideModel);
+      try {
+        const message = (await withCallTimeout(bind(overrideModel).invoke(lcMessages))) as AIMessage;
+        return { message, provider: opts.overrideProvider, model: opts.overrideModel };
+      } catch (overrideErr) {
+        logger.warn('Tenant tool-model override failed, falling back to the global fallback pair', {
+          overrideProvider: opts.overrideProvider, overrideModel: opts.overrideModel,
+          error: (overrideErr as Error).message,
+        });
+        const message = (await withCallTimeout(bind(this.fallback).invoke(lcMessages))) as AIMessage;
+        return { message, provider: config.llm.fallbackProvider, model: config.llm.fallbackModel };
+      }
     }
 
     try {
