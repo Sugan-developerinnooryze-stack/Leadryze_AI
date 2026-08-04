@@ -18,6 +18,19 @@ const BARE_AFFIRMATIVES = new Set([
   "let's do it", 'lets do it', 'go ahead', 'please book it', 'book that',
 ]);
 
+/** Short filler/interjection/negative words that are shaped exactly like a
+ * bare first name (1-2 capitalized-or-not alphabetic words) but never
+ * actually are one — "hmm"/"nice"/"no" would otherwise be wrongly accepted
+ * by the bare-name fallback below. Includes BARE_AFFIRMATIVES too, since
+ * "sure"/"ok"/"perfect" are just as name-shaped and just as wrong to accept
+ * as a name once resolveSlot() itself isn't the one consuming them (that
+ * only happens when a slot isn't already confirmingSlot — see below). */
+const NON_NAME_WORDS = new Set([
+  ...BARE_AFFIRMATIVES,
+  'hi', 'hello', 'hey', 'hmm', 'hm', 'um', 'uh', 'no', 'nope', 'nah', 'maybe',
+  'nice', 'cool', 'wow', 'great', 'thanks', 'thank you', 'welcome',
+]);
+
 const ORDINAL_WORDS: Record<string, number> = {
   first: 0, '1st': 0, one: 0,
   second: 1, '2nd': 1, two: 1,
@@ -107,6 +120,13 @@ export async function tryBookingConfirmationShortcut(
     return { handled: false };
   }
 
+  // Captured BEFORE slot resolution below (which may itself set
+  // confirmingSlot for the first time this turn) — this is what
+  // distinguishes "we already asked this exact question on a prior turn" from
+  // "we're asking it for the first time right now", see the interruptibility
+  // check further down.
+  const hadPendingConfirmation = !!bookingState.confirmingSlot;
+
   let slot = bookingState.confirmingSlot ?? null;
   if (!slot) {
     const resolved = resolveSlot(message, bookingState.offeredSlots);
@@ -122,10 +142,12 @@ export async function tryBookingConfirmationShortcut(
   let lastName  = cleanArg(leadCaptureState.lastName);
   const email   = cleanArg(captured.email) || cleanArg(leadCaptureState.email);
   const phone   = cleanArg(captured.phone) || cleanArg(leadCaptureState.phone);
+  let newlyExtractedName = false;
   if (captured.name && !firstName) {
     const parts = captured.name.split(/\s+/).filter(Boolean);
     firstName = parts[0];
     if (parts.length > 1) lastName = parts.slice(1).join(' ');
+    newlyExtractedName = true;
   }
   // extractCapturedData() only recognises a name framed as "my name is
   // X"/"call me X" — too narrow for THIS specific moment, where we just
@@ -134,13 +156,26 @@ export async function tryBookingConfirmationShortcut(
   // phrase at all. Only applied when we're already mid-confirmation
   // (confirmingSlot was set, i.e. this exact question was just asked) so it
   // never over-triggers on an ordinary, unrelated message elsewhere.
-  if (!firstName && bookingState.confirmingSlot) {
+  if (!firstName && hadPendingConfirmation) {
     const firstSegment = message.split(/[,;]| and /i)[0].trim();
-    if (/^[A-Z][a-zA-Z'-]+(\s+[A-Z][a-zA-Z'-]+)?$/i.test(firstSegment)) {
+    if (/^[A-Z][a-zA-Z'-]+(\s+[A-Z][a-zA-Z'-]+)?$/i.test(firstSegment) && !NON_NAME_WORDS.has(normalise(firstSegment))) {
       const parts = firstSegment.split(/\s+/).filter(Boolean);
       firstName = parts[0];
       if (parts.length > 1) lastName = parts.slice(1).join(' ');
+      newlyExtractedName = true;
     }
+  }
+
+  // Interruptible booking: we already asked this exact "name + contact"
+  // question on a PRIOR turn (confirmingSlot was already set coming in), and
+  // this message contains nothing that looks like an attempted answer — no
+  // email, no phone, no name-shaped segment. It's not a reply to the
+  // question at all (e.g. "what services do you provide?"), so don't repeat
+  // the same canned prompt at it. Bail out WITHOUT touching bookingState —
+  // confirmingSlot stays exactly as it is, so the paused booking resumes
+  // automatically the next time the visitor actually answers.
+  if (hadPendingConfirmation && !captured.email && !captured.phone && !newlyExtractedName) {
+    return { handled: false };
   }
 
   if (!firstName || (!email && !phone)) {

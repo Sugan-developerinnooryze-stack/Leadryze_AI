@@ -21,15 +21,24 @@ const ALL_TOOLS: AgentTool[] = [
   listDoctorsTool,
 ];
 
-// Names bound when a message reads as booking-only — narrows the tool set
-// (never blocks it) so a clearly booking-shaped turn doesn't also pay for
-// describing catalog/RAG tools it has no use for.
-const BOOKING_TOOL_NAMES = new Set(['check_meeting_availability', 'book_meeting', 'list_departments', 'list_doctors']);
+export type ToolHint = 'booking' | 'catalog' | 'website';
 
-export function getToolsForSurface(surface: ToolSurface, opts?: { bookingOnly?: boolean }): AgentTool[] {
+// Narrows the bound tool set for a clearly single-purpose turn (never blocks
+// it) so that turn doesn't also pay for describing tools it has no use for —
+// e.g. a booking-shaped message doesn't need catalog/RAG tools described.
+// See isBookingOnlyMessage()/isCatalogOnlyMessage()/isWebsiteOnlyMessage() in
+// base.agent.ts for the detectors that choose a hint.
+const TOOL_HINT_NAMES: Record<ToolHint, Set<string>> = {
+  booking: new Set(['check_meeting_availability', 'book_meeting', 'list_departments', 'list_doctors']),
+  catalog: new Set(['search_products', 'get_product_details']),
+  website: new Set(['search_website_knowledge']),
+};
+
+export function getToolsForSurface(surface: ToolSurface, opts?: { toolHint?: ToolHint }): AgentTool[] {
   const forSurface = ALL_TOOLS.filter((t) => t.surfaces.includes(surface));
-  if (opts?.bookingOnly) {
-    return forSurface.filter((t) => BOOKING_TOOL_NAMES.has(t.name));
+  if (opts?.toolHint) {
+    const names = TOOL_HINT_NAMES[opts.toolHint];
+    return forSurface.filter((t) => names.has(t.name));
   }
   return forSurface;
 }

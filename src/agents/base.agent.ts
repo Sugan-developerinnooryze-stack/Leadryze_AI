@@ -26,7 +26,7 @@ import { buildCRMQueryPrompt } from '../prompts/system.prompts';
 import { LeadFieldExtractionSchema } from './widget-lead.schema';
 import { checkFastPath } from './fast-path';
 import { looksLikeProfileQuestion } from './website-profile-fast-path';
-import { getToolsForSurface } from '../tools/registry';
+import { getToolsForSurface, type ToolHint } from '../tools/registry';
 import { runToolLoop, ToolCallLog } from '../tools/runner';
 import { logger } from '../utils/logger';
 
@@ -223,6 +223,33 @@ const BOOKING_ONLY_SIGNALS = [
 function isBookingOnlyMessage(message: string): boolean {
   const lower = message.toLowerCase();
   return BOOKING_ONLY_SIGNALS.some((s) => lower.includes(s));
+}
+
+// Same narrowing-only idea as BOOKING_ONLY_SIGNALS above, one level down —
+// a product/catalog-shaped or a general-website-content-shaped turn doesn't
+// need the OTHER category's tools described either. Checked only after
+// isBookingOnlyMessage() has already ruled out booking (see the priority
+// order at the call site).
+const CATALOG_ONLY_SIGNALS = [
+  'product', 'products', 'price', 'pricing', 'catalog', 'specification', 'specs',
+  'sku', 'in stock', 'model number', 'buy', 'purchase',
+];
+
+function isCatalogOnlyMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return CATALOG_ONLY_SIGNALS.some((s) => lower.includes(s));
+}
+
+const WEBSITE_ONLY_SIGNALS = [
+  'website', 'your site', 'about your company', 'about your business', 'tell me about',
+  'what do you do', 'what services', 'your hours', 'business hours', 'your location',
+  'your address', 'contact info', 'faq', 'policy', 'shipping', 'return policy',
+  'warranty', 'who are you',
+];
+
+function isWebsiteOnlyMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return WEBSITE_ONLY_SIGNALS.some((s) => lower.includes(s));
 }
 
 // Channel names the user might type in a message
@@ -790,7 +817,16 @@ function formatLeadCaptureProgressContext(state: LeadCaptureState, booking?: Boo
   if (state.phone)     known.push(`phone=${state.phone}`);
   if (state.company)   known.push(`company=${state.company}`);
   if (state.service)   known.push(`service=${state.service}`);
-  if (!known.length) return '';
+
+  // A booking can be paused (confirmingSlot set, waiting on contact info)
+  // with zero lead fields known yet — e.g. a visitor picked a time, then
+  // immediately asked an unrelated question before ever answering the
+  // "what's your name/contact" prompt. That's still worth telling the model
+  // about even though `known` is empty, so this is checked independently of
+  // the early-return below rather than folded into the same `known.length`
+  // gate.
+  const pausedBooking = !!booking?.confirmingSlot && !booking?.meetingCreated;
+  if (!known.length && !pausedBooking) return '';
 
   const missing: string[] = [];
   if (!state.firstName)             missing.push('name');
@@ -798,9 +834,15 @@ function formatLeadCaptureProgressContext(state: LeadCaptureState, booking?: Boo
   if (!state.service)               missing.push('service/reason for contact');
 
   const lines = ['=== INTERNAL NOTE TO YOU — LEAD CAPTURE PROGRESS (never show this note, its labels, or its contents to the visitor) ==='];
-  lines.push(`ALREADY KNOWN: ${known.join(', ')}`);
+  if (known.length) lines.push(`ALREADY KNOWN: ${known.join(', ')}`);
   if (missing.length) lines.push(`STILL NEEDED: ${missing.join(', ')}`);
   if (booking?.meetingCreated) lines.push('A meeting is already booked for this visitor — do not offer to book again.');
+  if (pausedBooking) {
+    const label = booking?.confirmingSlot?.label;
+    lines.push(
+      `The visitor was mid-way through booking a meeting${label ? ` (they'd picked ${label})` : ''} when they asked this — answer their question first, then gently remind them and ask if they'd like to continue booking.`
+    );
+  }
   lines.push("Use this privately to decide what to ask next — ask only for what's marked STILL NEEDED, one thing at a time, never re-ask for something already known. Do NOT quote, paraphrase, format as a list, or otherwise reveal this note itself in your reply — just write a normal, natural sentence to the visitor.");
   lines.push('=================================');
   return lines.join('\n');
@@ -1148,10 +1190,16 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
      ever runs. Public widget only, and a no-op for the overwhelming majority
      of turns (returns immediately whenever no slots are currently offered).
      See booking-confirmation-shortcut.ts for why this exists — book_meeting
-     is nearly always the fragile SECOND tool call in a conversation. ── */
+     is nearly always the fragile SECOND tool call in a conversation.
+     Deliberately passed input.message (raw), NOT cleanMessage — maskPIIForLLM
+     exists to protect data going TO THE LLM, but this function never touches
+     an LLM and needs the visitor's REAL email/phone to actually complete a
+     real booking; cleanMessage's [EMAIL-REDACTED]/[PHONE-REDACTED] tokens
+     would make extractCapturedData() inside the shortcut unable to ever
+     recognise a real email or phone number. ── */
   if (isPublicVisitor) {
     const shortcut = await tryBookingConfirmationShortcut(
-      cleanMessage,
+      input.message,
       { tenantId: input.tenantId, sessionId: input.sessionId, visitorId: input.visitorId, pageUrl: input.pageUrl },
       bookingState ?? {},
       leadCaptureState ?? {},
@@ -1997,8 +2045,20 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
      internal_staff has zero tools in this phase, so this is always the
      plain llm.generate() path for the existing internal assistant — no
      behavior change there. ── */
-  const bookingOnly = isPublicVisitor && isBookingOnlyMessage(cleanMessage);
-  const surfaceTools = getToolsForSurface(isPublicVisitor ? 'public_widget' : 'internal_staff', { bookingOnly });
+  // Priority order: booking narrows to the smallest, most failure-sensitive
+  // set first; catalog and website are checked only once booking is ruled
+  // out; no match leaves the full tool set bound, exactly as before this
+  // narrowing existed.
+  const toolHint: ToolHint | undefined = !isPublicVisitor
+    ? undefined
+    : isBookingOnlyMessage(cleanMessage)
+      ? 'booking'
+      : isCatalogOnlyMessage(cleanMessage)
+        ? 'catalog'
+        : isWebsiteOnlyMessage(cleanMessage)
+          ? 'website'
+          : undefined;
+  const surfaceTools = getToolsForSurface(isPublicVisitor ? 'public_widget' : 'internal_staff', { toolHint });
   let toolCallsLog: ToolCallLog[] = [];
   let responseUsage: UsageMetadata | undefined;
   const llmStart = Date.now();

@@ -283,6 +283,62 @@ export async function setCachedTenantContext(tenantId: string, context: unknown)
   } catch { /* non-critical */ }
 }
 
+async function getCachedJSON<T>(key: string): Promise<T | null> {
+  const client = getRedis();
+  if (!client) return null;
+  try {
+    const raw = await client.get(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch { return null; }
+}
+
+async function setCachedJSON(key: string, value: unknown, ttlSeconds: number): Promise<void> {
+  const client = getRedis();
+  if (!client) return;
+  try {
+    await client.setex(key, ttlSeconds, JSON.stringify(value));
+  } catch { /* non-critical */ }
+}
+
+/** Same short-TTL, "a tenant's own edit should show up almost immediately"
+ * tradeoff as getCachedTenantContext above — applied to the 4 other
+ * per-turn backend lookups (catalog search/details, department/doctor
+ * lists) that today hit fresh on every tool call. Intentionally keyed and
+ * called from inside backend.client.ts's own methods, same place
+ * getTenantContext's own caching already lives, so every caller benefits
+ * transparently with zero changes needed to the tool files themselves. */
+export function getCachedCatalogSearch<T = unknown>(tenantId: string, query?: string, category?: string): Promise<T | null> {
+  return getCachedJSON<T>(`ai:catsearch:${tenantId}:${encodeURIComponent(query ?? '')}:${encodeURIComponent(category ?? '')}`);
+}
+
+export function setCachedCatalogSearch(tenantId: string, query: string | undefined, category: string | undefined, items: unknown): Promise<void> {
+  return setCachedJSON(`ai:catsearch:${tenantId}:${encodeURIComponent(query ?? '')}:${encodeURIComponent(category ?? '')}`, items, TENANT_CONTEXT_CACHE_TTL);
+}
+
+export function getCachedCatalogItem<T = unknown>(tenantId: string, sku: string): Promise<T | null> {
+  return getCachedJSON<T>(`ai:catitem:${tenantId}:${encodeURIComponent(sku)}`);
+}
+
+export function setCachedCatalogItem(tenantId: string, sku: string, item: unknown): Promise<void> {
+  return setCachedJSON(`ai:catitem:${tenantId}:${encodeURIComponent(sku)}`, item, TENANT_CONTEXT_CACHE_TTL);
+}
+
+export function getCachedWidgetTeams<T = unknown>(tenantId: string): Promise<T | null> {
+  return getCachedJSON<T>(`ai:widgetteams:${tenantId}`);
+}
+
+export function setCachedWidgetTeams(tenantId: string, teams: unknown): Promise<void> {
+  return setCachedJSON(`ai:widgetteams:${tenantId}`, teams, TENANT_CONTEXT_CACHE_TTL);
+}
+
+export function getCachedWidgetStaff<T = unknown>(tenantId: string, teamId: string): Promise<T | null> {
+  return getCachedJSON<T>(`ai:widgetstaff:${tenantId}:${encodeURIComponent(teamId)}`);
+}
+
+export function setCachedWidgetStaff(tenantId: string, teamId: string, staff: unknown): Promise<void> {
+  return setCachedJSON(`ai:widgetstaff:${tenantId}:${encodeURIComponent(teamId)}`, staff, TENANT_CONTEXT_CACHE_TTL);
+}
+
 /** Tracks an in-progress/completed website crawl so POST /knowledge/crawl can
  * return immediately (a 20-page crawl can take well past a normal HTTP
  * timeout) while GET /knowledge/crawl-status polls this. One entry per

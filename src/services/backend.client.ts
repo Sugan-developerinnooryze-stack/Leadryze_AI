@@ -1,7 +1,13 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { getCachedTenantContext, setCachedTenantContext } from '../memory/conversation.memory';
+import {
+  getCachedTenantContext, setCachedTenantContext,
+  getCachedCatalogSearch, setCachedCatalogSearch,
+  getCachedCatalogItem, setCachedCatalogItem,
+  getCachedWidgetTeams, setCachedWidgetTeams,
+  getCachedWidgetStaff, setCachedWidgetStaff,
+} from '../memory/conversation.memory';
 
 /* ── Types matching the backend's internal endpoint response ── */
 export interface TenantAIConfig {
@@ -293,22 +299,33 @@ class BackendClient {
 
   /* ── Product Catalog ──────────────────────────────────────────────── */
 
-  /** Product search tool's backing call — a real Mongo text search, not RAG. */
+  /** Product search tool's backing call — a real Mongo text search, not RAG.
+   * Short-TTL cached (same 10s convention as getTenantContext) since a
+   * booking-then-catalog-question conversation can otherwise repeat the
+   * identical search within seconds. */
   async searchCatalogItems(tenantId: string, opts: { query?: string; category?: string }): Promise<CatalogSearchResult[]> {
+    const cached = await getCachedCatalogSearch<CatalogSearchResult[]>(tenantId, opts.query, opts.category);
+    if (cached) return cached;
     try {
       const res = await this.http.post<{ data: { items: CatalogSearchResult[] } }>('/api/internal/catalog/search', { tenantId, ...opts });
-      return res.data.data.items;
+      const items = res.data.data.items;
+      void setCachedCatalogSearch(tenantId, opts.query, opts.category, items);
+      return items;
     } catch (err) {
       logger.warn('BackendClient: searchCatalogItems failed', { error: (err as Error).message, tenantId });
       return [];
     }
   }
 
-  /** get_product_details tool's backing call. */
+  /** get_product_details tool's backing call. Short-TTL cached, same convention. */
   async getCatalogItemBySku(tenantId: string, sku: string): Promise<CatalogItemDetail | null> {
+    const cached = await getCachedCatalogItem<CatalogItemDetail>(tenantId, sku);
+    if (cached) return cached;
     try {
       const res = await this.http.get<{ data: { item: CatalogItemDetail | null } }>(`/api/internal/catalog/${tenantId}/sku/${encodeURIComponent(sku)}`);
-      return res.data.data.item;
+      const item = res.data.data.item;
+      if (item) void setCachedCatalogItem(tenantId, sku, item);
+      return item;
     } catch (err) {
       logger.warn('BackendClient: getCatalogItemBySku failed', { error: (err as Error).message, tenantId });
       return null;
@@ -535,11 +552,15 @@ class BackendClient {
    * between when booking. Empty result reads as "no departments configured"
    * — proceed straight to availability, not an error. */
   async getWidgetTeams(tenantId: string): Promise<Array<{ teamId: string; name: string }>> {
+    const cached = await getCachedWidgetTeams<Array<{ teamId: string; name: string }>>(tenantId);
+    if (cached) return cached;
     try {
       const res = await this.http.get<{ data: { teams: Array<{ teamId: string; name: string }> } }>(
         '/api/internal/widget-teams', { params: { tenantId } },
       );
-      return res.data.data?.teams ?? [];
+      const teams = res.data.data?.teams ?? [];
+      void setCachedWidgetTeams(tenantId, teams);
+      return teams;
     } catch (err) {
       logger.warn('BackendClient: getWidgetTeams failed', { error: (err as Error).message, tenantId });
       return [];
@@ -548,11 +569,15 @@ class BackendClient {
 
   /** Active staff (doctors) within one chosen department. */
   async getWidgetStaff(tenantId: string, teamId: string): Promise<Array<{ staffId: string; name: string }>> {
+    const cached = await getCachedWidgetStaff<Array<{ staffId: string; name: string }>>(tenantId, teamId);
+    if (cached) return cached;
     try {
       const res = await this.http.get<{ data: { staff: Array<{ staffId: string; name: string }> } }>(
         '/api/internal/widget-staff', { params: { tenantId, teamId } },
       );
-      return res.data.data?.staff ?? [];
+      const staff = res.data.data?.staff ?? [];
+      void setCachedWidgetStaff(tenantId, teamId, staff);
+      return staff;
     } catch (err) {
       logger.warn('BackendClient: getWidgetStaff failed', { error: (err as Error).message, tenantId });
       return [];
