@@ -2135,12 +2135,31 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     );
     const isProfileShapedQuestion = looksLikeProfileQuestion(cleanMessage);
     const hasProfileMatch = hasNonEmptyProfile && isProfileShapedQuestion;
+    // A booking-shaped message (e.g. the quick-reply chip's own literal
+    // "Book an appointment" text) is never a factual claim needing RAG
+    // grounding — the tool set is already narrowed away from RAG/catalog for
+    // these turns (see toolHint above), so the model has no way to
+    // "confidently ground" anything except via a real booking-tool call.
+    // Without this exemption, a bare booking request answered with a plain
+    // clarifying question (or a tool call that failed/was never attempted)
+    // falls through to the ambient RAG pre-fetch score — which reflects
+    // UNRELATED page content and is almost always low for a scheduling
+    // question — wrongly triggering the "I don't have a confident answer
+    // from our records" deflection on a turn that was never asking a
+    // factual question at all. A genuinely successful booking-tool call
+    // still counts via classifyResponseConfidence's own `bookingHit` branch.
+    const isBookingShapedQuestion = toolHint === 'booking';
+    const bookingToolHit = toolCallsLog.some(
+      (t) => (t.name === 'check_meeting_availability' || t.name === 'book_meeting') && t.ok
+    );
     // A profile-shaped question counts as "attempted grounding" even when it
     // scored zero RAG similarity and called no tool — otherwise a never-
     // crawled tenant asked "tell me about your business" skips this gate
     // entirely (no score, no tool call) and the LLM free-associates using
     // only companyName instead of admitting it doesn't know yet.
-    const attemptedGrounding = ragTopScore > 0 || toolCallsLog.length > 0 || isProfileShapedQuestion;
+    const attemptedGrounding = isBookingShapedQuestion
+      ? bookingToolHit
+      : (ragTopScore > 0 || toolCallsLog.length > 0 || isProfileShapedQuestion);
     const { source: responseSource, confidence: responseConfidence } = classifyResponseConfidence(ragTopScore, toolCallsLog, hasProfileMatch);
     if (isPublicVisitor && attemptedGrounding && responseConfidence < CONFIDENCE_THRESHOLD) {
       response = "That's a good question, but I don't have a confident answer from our records — let me connect you with our team so they can help directly. Could I get your name and best way to reach you?";
