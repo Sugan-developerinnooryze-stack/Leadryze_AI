@@ -23,6 +23,10 @@ export interface ResolvedTenantConfig {
    * base.agent.ts). Always a real number — a plan-tier default when the
    * tenant has no explicit aiConfig.monthlyTokenLimit override. */
   monthlyTokenLimit: number;
+  /** Monthly minute budget for CONTINUOUS voice conversations specifically
+   * (LiveKit room-minutes) — a separate meter from monthlyTokenLimit above,
+   * same "always a real number, plan-tier default when unset" convention. */
+  monthlyVoiceMinutesLimit: number;
   /** Which already-integrated LLM provider/model powers RAG/catalog/booking
    * tool-calling for this tenant — undefined means "use the global primary/
    * fallback pair", today's unchanged default. */
@@ -33,6 +37,18 @@ export interface ResolvedTenantConfig {
    * into the department/doctor wizard, so today's tenant-wide booking flow
    * stays completely unaffected. */
   hasWidgetDepartments: boolean;
+  /** Tenant-configurable booking requirements — replaces the old implicit
+   * "always ask about department if one exists, always require email-or-
+   * phone" assumptions. bookingRequireTeam already has the
+   * `?? hasWidgetDepartments` fallback baked in by the time it reaches
+   * here — an untouched tenant with visible teams still gets asked, same
+   * as before this field existed; only an explicit `false` suppresses it. */
+  bookingRequireTeam: boolean;
+  bookingRequireService: boolean;
+  bookingRequireName: boolean;
+  bookingContactRequirement: 'email_only' | 'phone_only' | 'email_or_phone' | 'email_and_phone';
+  bookingStaffLabel: string;
+  bookingTimezone: string;
 }
 
 /** Plan-tier default monthly token budgets — deliberately generous
@@ -42,6 +58,15 @@ const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
   starter: 300_000,
   professional: 1_500_000,
   enterprise: 8_000_000,
+};
+
+/** Plan-tier default monthly continuous-voice minute budgets — mirrors
+ * backend/src/modules/admin/admin.routes.ts's own default map for this same
+ * field (kept in sync manually, same as the token limits above). */
+const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
+  starter: 100,
+  professional: 500,
+  enterprise: 3000,
 };
 
 /**
@@ -197,7 +222,14 @@ export async function resolveTenantConfig(
       templates: [],
       websiteProfile: null,
       monthlyTokenLimit: DEFAULT_MONTHLY_TOKEN_LIMITS.starter,
+      monthlyVoiceMinutesLimit: DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS.starter,
       hasWidgetDepartments: false,
+      bookingRequireTeam: false,
+      bookingRequireService: false,
+      bookingRequireName: true,
+      bookingContactRequirement: 'email_or_phone',
+      bookingStaffLabel: 'team member',
+      bookingTimezone: 'UTC',
     };
   }
 
@@ -219,7 +251,16 @@ export async function resolveTenantConfig(
     monthlyTokenLimit: ctx.tenant.aiConfig?.monthlyTokenLimit
       ?? DEFAULT_MONTHLY_TOKEN_LIMITS[ctx.tenant.plan]
       ?? DEFAULT_MONTHLY_TOKEN_LIMITS.starter,
+    monthlyVoiceMinutesLimit: ctx.tenant.aiConfig?.monthlyVoiceMinutesLimit
+      ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS[ctx.tenant.plan]
+      ?? DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS.starter,
     toolModelPreset: ctx.tenant.aiConfig?.toolModelPreset,
     hasWidgetDepartments: ctx.hasWidgetDepartments ?? false,
+    bookingRequireTeam: ctx.bookingRequireTeam ?? ctx.hasWidgetDepartments ?? false,
+    bookingRequireService: ctx.bookingRequireService ?? false,
+    bookingRequireName: ctx.bookingRequireName ?? true,
+    bookingContactRequirement: ctx.bookingContactRequirement ?? 'email_or_phone',
+    bookingStaffLabel: ctx.bookingStaffLabel || 'team member',
+    bookingTimezone: ctx.bookingTimezone || 'UTC',
   };
 }

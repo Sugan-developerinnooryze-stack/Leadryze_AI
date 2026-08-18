@@ -8,6 +8,7 @@ import { requireApiKey } from './middlewares/api-key.middleware';
 import chatRoutes from './api/chat.routes';
 import knowledgeRoutes from './api/knowledge.routes';
 import templateAnalysisRoutes from './api/template-analysis.routes';
+import voiceRoutes from './api/voice.routes';
 import { logger } from './utils/logger';
 import { config } from './config';
 import { getRedisClient } from './core/guardrails/rate-limiter';
@@ -90,6 +91,25 @@ app.get('/health/detail', requireApiKey, async (_req, res) => {
     LLM_FALLBACK_MODEL:    config.llm.fallbackModel,
   };
 
+  // Voice Agent Worker liveness — a SIBLING field, deliberately NOT part of
+  // `checks`/`allOk`. The worker is a separate, optional process (see
+  // ai/src/voice-agent/worker.ts) — its absence must never make this core
+  // Express service report itself as degraded. Reads the self-expiring
+  // heartbeat key the worker writes every ~15s (45s TTL) so a crashed/killed
+  // worker's key ages out on its own with no explicit cleanup needed.
+  let voiceAgent: { running: boolean; lastHeartbeatAt: string | null; ageSeconds: number | null } = {
+    running: false, lastHeartbeatAt: null, ageSeconds: null,
+  };
+  try {
+    const redis = getRedisClient();
+    const raw = redis ? await redis.get('ai:voiceagent:heartbeat') : null;
+    if (raw) {
+      const parsed = JSON.parse(raw) as { updatedAt: string };
+      const ageSeconds = (Date.now() - new Date(parsed.updatedAt).getTime()) / 1000;
+      voiceAgent = { running: true, lastHeartbeatAt: parsed.updatedAt, ageSeconds };
+    }
+  } catch { /* voiceAgent stays { running: false, ... } */ }
+
   const allOk = Object.values(checks).every((v) => v === 'ok');
   res.status(allOk ? 200 : 207).json({
     status: allOk ? 'ok' : 'degraded',
@@ -97,12 +117,14 @@ app.get('/health/detail', requireApiKey, async (_req, res) => {
     timestamp: new Date().toISOString(),
     checks,
     keys,
+    voiceAgent,
   });
 });
 
 app.use('/api', requireApiKey, chatRoutes);
 app.use('/api', requireApiKey, knowledgeRoutes);
 app.use('/api', requireApiKey, templateAnalysisRoutes);
+app.use('/api', requireApiKey, voiceRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({ success: false, message: 'Not found' });

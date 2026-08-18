@@ -1,10 +1,16 @@
 import { z } from 'zod';
 import { AgentTool } from './tool.types';
 import { backendClient } from '../services/backend.client';
+import { cleanArg } from '../utils/clean-arg';
 
 const schema = z.object({
-  query: z.string().optional().describe('What the visitor is looking for, e.g. "butterfly valve" — omit to just browse a category'),
-  category: z.string().optional().describe('A product category the visitor mentioned, if any'),
+  // .nullish(), not just .optional() — confirmed live elsewhere in this
+  // codebase (list_departments's serviceHint) that Groq's function-calling
+  // sometimes fills an unset optional string with an explicit `null`
+  // rather than omitting it, which .optional() alone rejects, failing the
+  // whole tool call before execute() ever runs. See list-departments.tool.ts.
+  query: z.string().nullish().describe('What the visitor is looking for, e.g. "butterfly valve" — omit to just browse a category'),
+  category: z.string().nullish().describe('A product category the visitor mentioned, if any'),
 });
 
 export const searchProductsTool: AgentTool<z.infer<typeof schema>> = {
@@ -16,7 +22,7 @@ export const searchProductsTool: AgentTool<z.infer<typeof schema>> = {
   schema,
   surfaces: ['public_widget'],
   async execute(args, ctx) {
-    const items = await backendClient.searchCatalogItems(ctx.tenantId, { query: args.query, category: args.category });
+    const items = await backendClient.searchCatalogItems(ctx.tenantId, { query: cleanArg(args.query), category: cleanArg(args.category) });
     if (!items.length) {
       return { ok: true, summary: 'No matching products found in the catalog for this query.' };
     }

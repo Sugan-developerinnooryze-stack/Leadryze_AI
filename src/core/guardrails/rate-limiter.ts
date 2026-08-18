@@ -115,6 +115,42 @@ export async function checkTenantTokenQuota(
   return { blocked: percentUsed >= 1, percentUsed };
 }
 
+/** Continuous-voice equivalent of checkTenantTokenQuota() above — a
+ * completely separate meter (LiveKit room-minutes), checked once per
+ * utterance during a call, same short-TTL Redis cache. Since a session's
+ * real usage is only known once it CLOSES (not mid-call), this checks
+ * accumulated usage from PREVIOUS completed sessions this month, not the
+ * in-progress one — a call already underway when the tenant crosses their
+ * budget can finish before the NEXT session gets blocked. Same tradeoff
+ * checkTenantTokenQuota() already accepts via its own cache staleness
+ * window, just coarser (whole sessions instead of whole messages). */
+export async function checkTenantVoiceMinutesQuota(
+  tenantId: string,
+  monthlyLimit: number
+): Promise<{ blocked: boolean; percentUsed: number }> {
+  if (!monthlyLimit || monthlyLimit <= 0) return { blocked: false, percentUsed: 0 };
+
+  const cacheKey = `ai:voicequota:${tenantId}`;
+
+  if (redis && redisAvailable) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached !== null) {
+        const usedMinutes = parseFloat(cached);
+        const percentUsed = usedMinutes / monthlyLimit;
+        return { blocked: percentUsed >= 1, percentUsed };
+      }
+    } catch { /* fall through to the backend fetch below */ }
+  }
+
+  const usedMinutes = await backendClient.getTenantVoiceMinutesUsageThisMonth(tenantId);
+  if (redis && redisAvailable) {
+    try { await redis.set(cacheKey, String(usedMinutes), 'EX', TOKEN_QUOTA_CACHE_TTL_SECONDS); } catch { /* best-effort cache only */ }
+  }
+  const percentUsed = usedMinutes / monthlyLimit;
+  return { blocked: percentUsed >= 1, percentUsed };
+}
+
 /**
  * Day-bucket sibling for the PDF/Image Template Analyzer — a vision/PDF call
  * costs meaningfully more per-request than a chat turn, so it gets its own,

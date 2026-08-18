@@ -3,7 +3,7 @@ import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatGroq } from '@langchain/groq';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
-import { HumanMessage, SystemMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
+import { HumanMessage, SystemMessage, AIMessage, AIMessageChunk, BaseMessage } from '@langchain/core/messages';
 import type { UsageMetadata } from '@langchain/core/messages';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type { ZodSchema } from 'zod';
@@ -139,6 +139,96 @@ class ModelAbstractionLayer {
     return this.primary;
   }
 
+  /** Boot-time liveness check for the two models every single call actually
+   * depends on (global primary + global fallback) — deliberately NOT every
+   * tenant's toolModelPreset override, since pinging N per-tenant
+   * combinations on every restart doesn't scale and isn't necessary: a dead
+   * override is instead caught gracefully at request time by
+   * runToolLoop()'s own short fallback chain (falls through to the global
+   * pair checked here). This is the check that would have caught the dead
+   * `gemini-2.0-flash-lite` fallback model at deploy time instead of mid
+   * conversation with a real visitor. */
+  async checkHealth(): Promise<{ primaryOk: boolean; fallbackOk: boolean }> {
+    // Generous relative to the per-turn PER_CALL_TIMEOUT_MS values above —
+    // this is a one-time, fire-and-forget boot check (see server.ts), not a
+    // latency-sensitive per-turn call, and a cold LangChain client's first
+    // real request can genuinely take longer than a warm one (confirmed
+    // live: the same model via the raw provider SDK responded in ~2s, but
+    // this wrapper's very first invoke() took longer) — a tight timeout
+    // here risks a false "model is dead" alarm on a model that's actually
+    // fine.
+    const HEALTH_CHECK_TIMEOUT_MS = 20000;
+    const ping = async (model: BaseChatModel, label: string, providerModel: string): Promise<boolean> => {
+      try {
+        await Promise.race([
+          model.invoke([new HumanMessage('ping')]),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`health check timed out after ${HEALTH_CHECK_TIMEOUT_MS}ms`)), HEALTH_CHECK_TIMEOUT_MS)
+          ),
+        ]);
+        return true;
+      } catch (err) {
+        logger.error(
+          `[LLM HEALTH CHECK] ${label} model (${providerModel}) failed a live ping at boot — every call that reaches this model will fail until this is fixed`,
+          { error: (err as Error).message }
+        );
+        return false;
+      }
+    };
+    const [primaryOk, fallbackOk] = await Promise.all([
+      ping(this.primary, 'primary', `${config.llm.provider}/${config.llm.model}`),
+      ping(this.fallback, 'fallback', `${config.llm.fallbackProvider}/${config.llm.fallbackModel}`),
+    ]);
+    if (primaryOk && fallbackOk) {
+      logger.info('[LLM HEALTH CHECK] primary and fallback models both responded to a live ping', {
+        primary: `${config.llm.provider}/${config.llm.model}`,
+        fallback: `${config.llm.fallbackProvider}/${config.llm.fallbackModel}`,
+      });
+    }
+    return { primaryOk, fallbackOk };
+  }
+
+  /** Streaming twin of generate() above — same primary→fallback shape, same
+   * LLMResponse return, but calls onChunk with each incremental text delta
+   * as it arrives. No tools involved at all (this is the plain, no-tool-loop
+   * path — internal_staff has zero bound tools in this codebase today), so
+   * there's no tool-call ambiguity to worry about, same as
+   * invokeWithToolsStream()'s own reasoning. */
+  async generateStream(messages: LLMMessage[], onChunk: (delta: string) => void): Promise<LLMResponse> {
+    const lcMessages = toLangChainMessages(messages);
+
+    const runStream = async (model: BaseChatModel, providerName: string, modelName: string) => {
+      const stream = await model.stream(lcMessages);
+      let accumulated: AIMessageChunk | undefined;
+      for await (const chunk of stream) {
+        accumulated = accumulated ? accumulated.concat(chunk) : chunk;
+        const delta = typeof chunk.content === 'string' ? chunk.content : '';
+        if (delta) onChunk(delta);
+      }
+      if (!accumulated) throw new Error('Empty stream response');
+      return {
+        content: typeof accumulated.content === 'string' ? accumulated.content : JSON.stringify(accumulated.content),
+        provider: providerName,
+        model: modelName,
+        usage: extractUsage(accumulated as unknown as AIMessage),
+      };
+    };
+
+    try {
+      return await runStream(this.primary, config.llm.provider, config.llm.model);
+    } catch (primaryErr) {
+      logger.warn('Primary LLM streaming failed, switching to fallback', {
+        error: (primaryErr as Error).message,
+      });
+      try {
+        return await runStream(this.fallback, config.llm.fallbackProvider, config.llm.fallbackModel);
+      } catch (fallbackErr) {
+        logger.error('All LLM providers failed (streaming)', { error: (fallbackErr as Error).message });
+        throw new Error('All LLM providers are unavailable. Please try again later.');
+      }
+    }
+  }
+
   /** Structured-output extraction, with the same primary/fallback shape as
    * generate() above — not invented from nothing: base.agent.ts's own
    * extractChatIntent() already calls `(llm.getModel() as any)
@@ -197,14 +287,29 @@ class ModelAbstractionLayer {
   async invokeWithTools(
     lcMessages: BaseMessage[],
     tools: DynamicStructuredTool[],
-    opts: { forceFallback?: boolean; overrideProvider?: string; overrideModel?: string } = {}
+    opts: {
+      forceFallback?: boolean;
+      overrideProvider?: string;
+      overrideModel?: string;
+      /** Per-call budget in ms — defaults to 20000. Voice callers pass a
+       * much tighter value (see runner.ts's fastDegrade path) since a
+       * hands-free conversation can't tolerate the same wait a text chat
+       * can. */
+      timeoutMs?: number;
+      /** When true, a primary/override failure is NOT chased by an internal
+       * fallback attempt — it throws immediately instead. Lets a caller
+       * (runToolLoop's fastDegrade path) bound the TOTAL number of real LLM
+       * attempts across a whole turn, rather than each invokeWithTools()
+       * call silently spending up to 2 attempts on its own. */
+      singleAttempt?: boolean;
+    } = {}
   ): Promise<{ message: AIMessage; provider: string; model: string }> {
     const bind = (model: BaseChatModel) =>
       typeof (model as any).bindTools === 'function' && tools.length
         ? (model as any).bindTools(tools)
         : model;
 
-    const PER_CALL_TIMEOUT_MS = 20000;
+    const PER_CALL_TIMEOUT_MS = opts.timeoutMs ?? 20000;
     const withCallTimeout = <T>(p: Promise<T>): Promise<T> =>
       Promise.race([
         p,
@@ -233,6 +338,7 @@ class ModelAbstractionLayer {
         const message = (await withCallTimeout(bind(overrideModel).invoke(lcMessages))) as AIMessage;
         return { message, provider: opts.overrideProvider, model: opts.overrideModel };
       } catch (overrideErr) {
+        if (opts.singleAttempt) throw overrideErr;
         logger.warn('Tenant tool-model override failed, falling back to the global fallback pair', {
           overrideProvider: opts.overrideProvider, overrideModel: opts.overrideModel,
           error: (overrideErr as Error).message,
@@ -246,11 +352,81 @@ class ModelAbstractionLayer {
       const message = (await withCallTimeout(bind(this.primary).invoke(lcMessages))) as AIMessage;
       return { message, provider: config.llm.provider, model: config.llm.model };
     } catch (primaryErr) {
+      if (opts.singleAttempt) throw primaryErr;
       logger.warn('Primary LLM tool-call invoke failed, switching to fallback', {
         error: (primaryErr as Error).message,
       });
       const message = (await withCallTimeout(bind(this.fallback).invoke(lcMessages))) as AIMessage;
       return { message, provider: config.llm.fallbackProvider, model: config.llm.fallbackModel };
+    }
+  }
+
+  /** Streaming twin of invokeWithTools() above — same primary→fallback shape,
+   * same {message, provider, model} return, but calls onChunk with each
+   * incremental text delta AS IT ARRIVES rather than only once the whole
+   * response is complete.
+   *
+   * DELIBERATELY ONLY SAFE (and only ever called in this codebase) with
+   * `tools=[]` — a genuinely tool-bound streaming call would need to decide,
+   * mid-stream, whether the response is going to be a tool_call or plain
+   * prose, and speculatively-streamed-then-discarded tool-call text is a
+   * real correctness risk (a visitor hearing/reading a stray sentence that
+   * gets abandoned once tool_call_chunks appear) — not attempted here. With
+   * no tools bound, the response is unambiguously prose from the first
+   * chunk, so this is unconditionally safe to stream. See runner.ts's own
+   * "final unbound call" (tools=[] there too) for the one caller that uses
+   * this today. */
+  async invokeWithToolsStream(
+    lcMessages: BaseMessage[],
+    tools: DynamicStructuredTool[],
+    opts: { overrideProvider?: string; overrideModel?: string; timeoutMs?: number; singleAttempt?: boolean } = {},
+    onChunk?: (delta: string) => void,
+  ): Promise<{ message: AIMessage; provider: string; model: string }> {
+    const bind = (model: BaseChatModel) =>
+      typeof (model as any).bindTools === 'function' && tools.length
+        ? (model as any).bindTools(tools)
+        : model;
+
+    const PER_CALL_TIMEOUT_MS = opts.timeoutMs ?? 20000;
+
+    const runStream = async (model: BaseChatModel, providerName: string, modelName: string) => {
+      const stream = await bind(model).stream(lcMessages);
+      let accumulated: AIMessageChunk | undefined;
+      const start = Date.now();
+      for await (const chunk of stream) {
+        if (Date.now() - start > PER_CALL_TIMEOUT_MS) {
+          throw new Error(`LLM stream timed out after ${PER_CALL_TIMEOUT_MS}ms`);
+        }
+        accumulated = accumulated ? accumulated.concat(chunk) : chunk;
+        const delta = typeof chunk.content === 'string' ? chunk.content : '';
+        if (delta && onChunk) onChunk(delta);
+      }
+      if (!accumulated) throw new Error('Empty stream response');
+      return { message: accumulated as unknown as AIMessage, provider: providerName, model: modelName };
+    };
+
+    if (opts.overrideProvider && opts.overrideModel) {
+      const overrideModel = this.getOverrideModel(opts.overrideProvider, opts.overrideModel);
+      try {
+        return await runStream(overrideModel, opts.overrideProvider, opts.overrideModel);
+      } catch (overrideErr) {
+        if (opts.singleAttempt) throw overrideErr;
+        logger.warn('Tenant tool-model override streaming failed, falling back to the global fallback pair', {
+          overrideProvider: opts.overrideProvider, overrideModel: opts.overrideModel,
+          error: (overrideErr as Error).message,
+        });
+        return await runStream(this.fallback, config.llm.fallbackProvider, config.llm.fallbackModel);
+      }
+    }
+
+    try {
+      return await runStream(this.primary, config.llm.provider, config.llm.model);
+    } catch (primaryErr) {
+      if (opts.singleAttempt) throw primaryErr;
+      logger.warn('Primary LLM streaming invoke failed, switching to fallback', {
+        error: (primaryErr as Error).message,
+      });
+      return await runStream(this.fallback, config.llm.fallbackProvider, config.llm.fallbackModel);
     }
   }
 }

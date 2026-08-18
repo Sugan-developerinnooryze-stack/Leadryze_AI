@@ -5,6 +5,7 @@ import { logger } from './utils/logger';
 import { ensureCollection, getQdrantClient } from './rag/qdrant.client';
 import { VECTOR_SIZE } from './rag/embeddings';
 import { connectRateLimiterRedis } from './core/guardrails/rate-limiter';
+import { llm } from './core/model-abstraction/llm.provider';
 
 async function bootstrap() {
   try {
@@ -44,6 +45,14 @@ async function bootstrap() {
       logger.info(`LeadRyze AI service running on port ${port}`);
       logger.info(`Swagger UI: http://localhost:${port}/api-docs`);
       logger.info(`LLM provider: ${config.llm.provider} / ${config.llm.model}`);
+    });
+
+    // Fire-and-forget: never blocks the server from accepting traffic — a
+    // dead model should be loud in the logs at boot, not add startup
+    // latency (voice/text calls right after a fresh deploy would otherwise
+    // wait on it for nothing on the common case where everything is fine).
+    llm.checkHealth().catch((err) => {
+      logger.error('[LLM HEALTH CHECK] unexpected error running boot-time health check', { error: (err as Error).message });
     });
 
     const shutdown = async (signal: string) => {

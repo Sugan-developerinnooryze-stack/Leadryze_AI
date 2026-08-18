@@ -114,6 +114,15 @@ export function checkFastPath(
   hasConnectors: boolean,
   qnaPairs: QnAPairInput[] = [],
   websiteProfile: WebsiteProfileSummary | null = null,
+  /** Real, confirmed bug this closes: a visitor mid-booking-flow who's just
+   * been asked "which department?" and replies with a genuinely valid but
+   * short team name (e.g. this tenant's own team is literally named "ss")
+   * was being intercepted here by the "very short/meaningless message"
+   * catch-all below, BEFORE the booking-flow logic ever saw it — producing
+   * a confusing generic deflection instead of continuing the flow. Set true
+   * whenever base.agent.ts's own bookingState shows an active flow
+   * expecting a short reply (department/staff/slot pick, yes/no, etc.). */
+  skipShortMessageCheck = false,
 ): FastPathResult {
   const n = normalise(message);
 
@@ -187,7 +196,7 @@ export function checkFastPath(
   }
 
   /* ── Very short / empty / meaningless messages ── */
-  if (n.length <= 2 || /^[.!?]+$/.test(n)) {
+  if (!skipShortMessageCheck && (n.length <= 2 || /^[.!?]+$/.test(n))) {
     return {
       handled: true,
       response: `I didn't quite catch that. Could you ask me something about ${companyName}'s products, pricing, or records?`,

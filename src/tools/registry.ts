@@ -34,8 +34,24 @@ const TOOL_HINT_NAMES: Record<ToolHint, Set<string>> = {
   website: new Set(['search_website_knowledge']),
 };
 
-export function getToolsForSurface(surface: ToolSurface, opts?: { toolHint?: ToolHint }): AgentTool[] {
-  const forSurface = ALL_TOOLS.filter((t) => t.surfaces.includes(surface));
+// Real, confirmed gap this closes: a tenant with bookingRequireTeam:false
+// gets zero department-related PROMPT text, but list_departments/
+// list_doctors stayed bound and technically callable regardless — nothing
+// but the prompt stopped the model from calling them anyway, which Groq's
+// small model has been observed to do. base.agent.ts passes this set as
+// excludeNames whenever the tenant wants department questions skipped AND
+// no team/staff is already resolved for this session (so an in-progress
+// pick from before the setting changed doesn't get stranded mid-flow).
+export const DEPARTMENT_TOOL_NAMES = new Set(['list_departments', 'list_doctors']);
+
+export function getToolsForSurface(
+  surface: ToolSurface,
+  opts?: { toolHint?: ToolHint; excludeNames?: Set<string> },
+): AgentTool[] {
+  let forSurface = ALL_TOOLS.filter((t) => t.surfaces.includes(surface));
+  if (opts?.excludeNames?.size) {
+    forSurface = forSurface.filter((t) => !opts.excludeNames!.has(t.name));
+  }
   if (opts?.toolHint) {
     const names = TOOL_HINT_NAMES[opts.toolHint];
     return forSurface.filter((t) => names.has(t.name));

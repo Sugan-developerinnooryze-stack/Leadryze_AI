@@ -99,10 +99,38 @@ export const config = {
  * model string that exists anywhere in this codebase) since gpt-4o-mini is
  * the only OpenAI model literal already present. */
 export const TOOL_MODEL_PRESETS: Record<'groq' | 'anthropic' | 'openai' | 'google', { provider: string; model: string }> = {
-  groq:      { provider: 'groq',      model: config.llm.provider === 'groq'      ? config.llm.model : (config.llm.fallbackProvider === 'groq'      ? config.llm.fallbackModel : 'llama-3.1-8b-instant') },
-  google:    { provider: 'gemini',    model: config.llm.provider === 'gemini'    ? config.llm.model : (config.llm.fallbackProvider === 'gemini'    ? config.llm.fallbackModel : 'gemini-2.0-flash-lite') },
+  groq:      { provider: 'groq',      model: config.llm.provider === 'groq'      ? config.llm.model : (config.llm.fallbackProvider === 'groq'      ? config.llm.fallbackModel : 'openai/gpt-oss-20b') },
+  google:    { provider: 'gemini',    model: config.llm.provider === 'gemini'    ? config.llm.model : (config.llm.fallbackProvider === 'gemini'    ? config.llm.fallbackModel : 'gemini-flash-latest') },
   anthropic: { provider: 'anthropic', model: config.llm.provider === 'anthropic' ? config.llm.model : (config.llm.fallbackProvider === 'anthropic' ? config.llm.fallbackModel : 'claude-haiku-4-5-20251001') },
   openai:    { provider: 'openai',    model: config.llm.provider === 'openai'    ? config.llm.model : (config.llm.fallbackProvider === 'openai'    ? config.llm.fallbackModel : 'gpt-4o-mini') },
+};
+
+/** Curated Cartesia voice presets for CONTINUOUS voice (real, verified IDs —
+ * fetched live from Cartesia's own GET /voices API using the configured
+ * CARTESIA_API_KEY, not guessed). Kept small and clean-professional rather
+ * than emotion-variant/persona-named voices Cartesia's own catalog also has
+ * many of (e.g. "Carson - Angry Friendly Support") — a tenant picks Male or
+ * Female, not a mood. Push-to-talk's own Groq/Orpheus voice stays separate
+ * (its voice names remain unverified pending that model's terms being
+ * accepted) — this preset map is Cartesia-only, matching
+ * Tenant.widget.voice.voicePreset.provider's own 'cartesia'-only type. */
+export const CARTESIA_VOICE_PRESETS: Record<'female' | 'male', {
+  provider: 'cartesia'; voiceId: string; displayName: string; gender: 'male' | 'female'; language: string;
+}> = {
+  female: {
+    provider: 'cartesia',
+    voiceId: '8a1b8af0-c4f6-423f-a268-5507fd4aefdf', // "Denise - Professional Woman"
+    displayName: 'Denise (Professional Woman)',
+    gender: 'female',
+    language: 'en',
+  },
+  male: {
+    provider: 'cartesia',
+    voiceId: '5cf0e4d9-ca2b-4fd5-81fa-89db3b645539', // "Derrick - Professional Man"
+    displayName: 'Derrick (Professional Man)',
+    gender: 'male',
+    language: 'en',
+  },
 };
 
 if (config.app.env === 'production') {

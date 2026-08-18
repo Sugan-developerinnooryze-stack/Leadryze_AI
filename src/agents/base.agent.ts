@@ -13,20 +13,21 @@ import {
   getLeadCaptureState, setLeadCaptureState, type LeadCaptureState,
   getBookingState, type BookingState,
   type PendingIntent,
+  acquireTurnLock, releaseTurnLock, shouldSpeakTurnLockFallback,
 } from '../memory/conversation.memory';
 import { moderateContent, detectPromptInjection } from '../core/guardrails/moderation';
 import { maskPIIForLLM } from '../core/guardrails/pii-filter';
-import { checkTenantRateLimit, checkTenantTokenQuota } from '../core/guardrails/rate-limiter';
+import { checkTenantRateLimit, checkTenantTokenQuota, checkTenantVoiceMinutesQuota } from '../core/guardrails/rate-limiter';
 import { resolveTenantConfig } from '../services/context.builder';
 import { cleanArg } from '../utils/clean-arg';
 import { extractCapturedData } from '../utils/extract-captured-data';
-import { tryBookingConfirmationShortcut } from './booking-confirmation-shortcut';
+import { tryBookingConfirmationShortcut, tryDepartmentSelectionShortcut, tryAvailabilityRequestShortcut } from './booking-confirmation-shortcut';
 import { backendClient, type CRMSearchResult } from '../services/backend.client';
 import { buildCRMQueryPrompt } from '../prompts/system.prompts';
 import { LeadFieldExtractionSchema } from './widget-lead.schema';
 import { checkFastPath } from './fast-path';
 import { looksLikeProfileQuestion } from './website-profile-fast-path';
-import { getToolsForSurface, type ToolHint } from '../tools/registry';
+import { getToolsForSurface, DEPARTMENT_TOOL_NAMES, type ToolHint } from '../tools/registry';
 import { runToolLoop, ToolCallLog } from '../tools/runner';
 import { logger } from '../utils/logger';
 
@@ -45,6 +46,31 @@ export interface AgentInput {
    * creates a spurious Lead. */
   visitorId?: string;
   pageUrl?: string;
+  /** Which surface this turn actually came through — defaults to 'text'
+   * (today's unchanged behavior) when omitted. Only meaningfully read by the
+   * continuous-voice quota gate below, which needs to distinguish a
+   * LiveKit-originated turn from a typed/push-to-talk one (both of those
+   * share the tenant's LLM-token budget, not the voice-minutes one). */
+  channel?: 'text' | 'push_to_talk' | 'continuous_voice';
+  /** Continuous-voice only — LeadAgentLLMStream's own AbortController signal,
+   * set when the framework decides this turn has been superseded (the
+   * visitor interrupted/spoke again before this turn finished). Checked at a
+   * couple of natural checkpoints below (before real work starts, and right
+   * before the single most expensive stage — the LLM/tool-loop call) so an
+   * abandoned turn frees the Redis turn lock and stops doing wasted work
+   * instead of running its full, uncancellable duration in the background.
+   * Never set for text/push-to-talk callers — always undefined there,
+   * meaning every check below is a no-op for those paths. */
+  abortSignal?: AbortSignal;
+  /** Continuous-voice only — when set, the final natural-language reply
+   * streams incrementally through this callback (in addition to still being
+   * returned as one complete string in AgentOutput.response, so every
+   * existing caller/log/lead-capture path is completely unaffected). Only
+   * populated for the call shapes that are unconditionally safe to stream
+   * (no tools bound, so no tool-call ambiguity) — see runner.ts's own
+   * invokeWithToolsStream() comment for why tool-bound iterations
+   * themselves are never streamed. */
+  onChunk?: (delta: string) => void;
 }
 
 export interface AgentOutput {
@@ -66,6 +92,36 @@ const USER_ESCALATION_PHRASES = [
   'human support', 'i want to sue', 'legal action',
 ];
 
+// Real, previously-total gap, confirmed by direct code research: continuous
+// voice (LeadAgentLLMStream) bypasses the LLM framework's own chatCtx system
+// content entirely and reuses this exact text-chat prompt-assembly path with
+// zero voice-specific tailoring — the only "voice" instruction anywhere
+// (worker.ts's own voice.Agent `instructions` field) never actually reaches
+// the model. Appended to systemContent, gated on channel, for both
+// continuous_voice and push_to_talk (both are spoken conversations).
+const VOICE_CONVERSATION_INSTRUCTIONS = `VOICE CONVERSATION BEHAVIOR
+You are a real-time customer-care voice assistant. Your goal is a natural conversation, not reading a written answer aloud.
+1. Speak naturally and conversationally.
+2. Keep most responses to 1-2 short sentences.
+3. Ask only ONE question at a time.
+4. Never ask for information that is already known (see ALREADY KNOWN notes above, if present).
+5. Remember information provided earlier in this conversation.
+6. Do not restart the conversation after every turn.
+7. Do not repeat greetings unnecessarily.
+8. Do not repeat the same question after receiving an answer.
+9. Acknowledge what the customer said before asking the next question.
+10. Proactively guide the customer toward their goal — suggest a next step.
+11. If the customer is unsure, offer useful options.
+12. If the customer changes topic, handle the new topic naturally.
+13. If the customer interrupts, respond to the new information, not the old.
+14. Never say "I'm still working" or similar filler more than once.
+15. Never expose internal tools, LLMs, APIs, processing, states, or locks.
+16. Never read markdown, bullets, JSON, URLs, or technical formatting aloud.
+17. Confirm emails, phone numbers, dates, and times clearly when given.
+18. Before booking, summarize the final details and ask for confirmation.
+19. After booking, clearly confirm success.
+20. After completing a task, naturally ask if there's anything else you can help with.`;
+
 const LLM_TIMEOUT_MS = 50000;
 // The tool loop has its own internal budget (35s, see runner.ts) plus a
 // final unbound call that can itself retry primary->fallback (up to 2 more
@@ -74,10 +130,23 @@ const LLM_TIMEOUT_MS = 50000;
 // safely under the backend's own axios proxy timeout to /api/chat (raised to
 // 100s for this path — see ai.routes.ts).
 const TOOL_LOOP_TIMEOUT_MS = 90000;
+// Per-real-LLM-call budget, channel-aware — a hands-free continuous-voice
+// conversation can't tolerate the same wait a text/push-to-talk reply can,
+// so it gets a much tighter cap AND (via fastDegrade below) a short,
+// single-fallback-hop chain instead of the full multi-call chain text keeps.
+const VOICE_LLM_CALL_TIMEOUT_MS = 6000;
+const TEXT_LLM_CALL_TIMEOUT_MS = 10000;
 // maybeCaptureWidgetLead() runs fire-and-forget (see its call sites below) —
 // this timeout is defense-in-depth only, since nothing awaits this call
 // anymore, but it still stops a hung request from lingering indefinitely.
 const LEAD_EXTRACTION_TIMEOUT_MS = 15000;
+
+// extractCapturedData()'s regex captures a name verbatim as the visitor
+// typed/said it (e.g. a lowercase "sugan") — this only normalizes display
+// casing, it never changes what's actually stored as meaningfully different.
+function titleCase(s: string): string {
+  return s.replace(/\p{L}[\p{L}'-]*/gu, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
+}
 
 function shouldEscalate(response: string, userMessage: string): boolean {
   const responseLower = response.toLowerCase();
@@ -105,15 +174,23 @@ async function maybeCaptureWidgetLead(
 ): Promise<void> {
   if (!input.visitorId) return;
   try {
-    const state: LeadCaptureState = (await getLeadCaptureState(input.sessionId)) ?? {};
+    const state: LeadCaptureState = (await getLeadCaptureState(input.tenantId, input.sessionId)) ?? {};
     if (state.leadCreated) return;
 
     if (capturedNow.email && !state.email) state.email = capturedNow.email;
     if (capturedNow.phone && !state.phone) state.phone = capturedNow.phone;
-    if (capturedNow.name && !state.firstName) {
+    // Deliberately NOT gated on `!state.firstName` — extractCapturedData()'s
+    // name pattern only ever fires on an explicit, unambiguous restatement
+    // ("my name is X" / "call me X" / "name: X"), never an incidental
+    // mention, so a later match is a genuine correction, not noise. This
+    // matters most for voice: a garbled STT transcription (e.g. "Súgun" from
+    // a mis-heard "Sugan") previously could never be corrected by the
+    // visitor typing/saying their name again — confirmed live, the exact
+    // failure this fix closes.
+    if (capturedNow.name) {
       const parts = capturedNow.name.split(/\s+/).filter(Boolean);
-      state.firstName = parts[0];
-      if (parts.length > 1) state.lastName = parts.slice(1).join(' ');
+      state.firstName = titleCase(parts[0]);
+      if (parts.length > 1) state.lastName = titleCase(parts.slice(1).join(' '));
     }
 
     // Only call the LLM when something's still missing — skip entirely once
@@ -160,7 +237,7 @@ async function maybeCaptureWidgetLead(
       }
     }
 
-    await setLeadCaptureState(input.sessionId, state);
+    await setLeadCaptureState(input.tenantId, input.sessionId, state);
 
     if (state.firstName && (state.email || state.phone)) {
       const result = await backendClient.createLeadFromWidget({
@@ -178,7 +255,7 @@ async function maybeCaptureWidgetLead(
       if (result.success && result.leadId) {
         state.leadCreated = true;
         state.leadId = result.leadId;
-        await setLeadCaptureState(input.sessionId, state);
+        await setLeadCaptureState(input.tenantId, input.sessionId, state);
       }
     }
   } catch (err) {
@@ -220,7 +297,10 @@ const BOOKING_ONLY_SIGNALS = [
   'appointment', 'book', 'schedule', 'slot', 'available time', 'meeting',
 ];
 
-function isBookingOnlyMessage(message: string): boolean {
+// Exported for reuse by the continuous-voice worker's own pre-tool-call
+// acknowledgement filler (LeadAgentLLMStream) — same detector, no duplicate
+// keyword list to drift out of sync.
+export function isBookingOnlyMessage(message: string): boolean {
   const lower = message.toLowerCase();
   return BOOKING_ONLY_SIGNALS.some((s) => lower.includes(s));
 }
@@ -245,6 +325,12 @@ const WEBSITE_ONLY_SIGNALS = [
   'what do you do', 'what services', 'your hours', 'business hours', 'your location',
   'your address', 'contact info', 'faq', 'policy', 'shipping', 'return policy',
   'warranty', 'who are you',
+  // Added after a live, confirmed miss: "what type of service you provide?"
+  // matched none of the phrases above (not the same adjacent words as "what
+  // services"), so toolHint stayed undefined, all 7 tools bound, and the
+  // model picked list_departments for a plain informational question.
+  'type of service', 'kind of service', 'what do you offer', 'do you offer',
+  'services do you', 'what services do',
 ];
 
 function isWebsiteOnlyMessage(message: string): boolean {
@@ -766,13 +852,27 @@ function mergePendingIntent(pending: PendingIntent, reply: ChatIntent | null): P
   return merged;
 }
 
+// Bounded caps on system-prompt content — a real, confirmed contributor to
+// tool-bound calls costing 3,900-5,700+ tokens: tenant custom instructions,
+// crawled website-profile fields, and Q&A pairs were all being injected
+// completely uncapped, resent in full on every one of the up to 4 real LLM
+// calls a single tool-loop turn can make (runner.ts). Plain truncation, not
+// a content-reduction pipeline — every field still reaches the model, just
+// bounded rather than unbounded.
+function truncate(text: string, maxChars: number): string {
+  return text.length > maxChars ? text.slice(0, maxChars) + '…' : text;
+}
+const MAX_QNA_PAIRS = 15;
+const MAX_QNA_ANSWER_CHARS = 500;
+const MAX_TENANT_SYSTEM_PROMPT_CHARS = 2000;
+
 /* ── Build Q&A context block for LLM injection ───────────────────── */
 function formatQnAContext(pairs: Array<{ question: string; answer: string; category: string }>): string {
   if (!pairs.length) return '';
   const lines = ['=== CUSTOM Q&A (TRAINED ANSWERS — ALWAYS USE THESE FIRST) ==='];
-  for (const p of pairs) {
+  for (const p of pairs.slice(0, MAX_QNA_PAIRS)) {
     lines.push(`Q: ${p.question}`);
-    lines.push(`A: ${p.answer}`);
+    lines.push(`A: ${truncate(p.answer, MAX_QNA_ANSWER_CHARS)}`);
     lines.push('');
   }
   lines.push('When the user asks something matching one of the above questions, use that answer exactly.');
@@ -786,19 +886,32 @@ function formatQnAContext(pairs: Array<{ question: string; answer: string; categ
  * involved, same "always-on injected context" shape as formatQnAContext
  * above. Only built when a profile actually exists (a never-crawled tenant
  * costs nothing extra). */
+const MAX_PROFILE_SUMMARY_CHARS = 800;
+const MAX_PROFILE_LIST_ITEMS = 20;
+
 function formatWebsiteProfileContext(profile: import('../services/backend.client').WebsiteProfileSummary): string {
   const lines = ['=== BUSINESS PROFILE (from this tenant\'s own crawled website) ==='];
-  if (profile.summary) lines.push(`Summary: ${profile.summary}`);
-  if (profile.services?.length) lines.push(`Services: ${profile.services.join(', ')}`);
+  if (profile.summary) lines.push(`Summary: ${truncate(profile.summary, MAX_PROFILE_SUMMARY_CHARS)}`);
+  if (profile.services?.length) lines.push(`Services: ${profile.services.slice(0, MAX_PROFILE_LIST_ITEMS).join(', ')}`);
   if (profile.contact?.address) lines.push(`Address: ${profile.contact.address}`);
   if (profile.contact?.phone) lines.push(`Phone: ${profile.contact.phone}`);
   if (profile.contact?.email) lines.push(`Email: ${profile.contact.email}`);
   if (profile.hours) lines.push(`Hours: ${profile.hours}`);
-  if (profile.staff?.length) {
-    lines.push(`Team: ${profile.staff.map((s) => (s.title ? `${s.name} (${s.title})` : s.name)).join(', ')}`);
+  const hasStaffBios = !!profile.staff?.length;
+  if (hasStaffBios) {
+    lines.push(`Team bios (from the website, for informational answers only): ${profile.staff!.slice(0, MAX_PROFILE_LIST_ITEMS).map((s) => (s.title ? `${s.name} (${s.title})` : s.name)).join(', ')}`);
   }
   if (lines.length === 1) return ''; // profile doc exists but every field is empty
-  lines.push('Use the above real facts when the visitor asks about the business, its services, location, hours, or team. Do not fabricate anything not listed above.');
+  lines.push('Use the above real facts when the visitor asks about the business, its services, location, hours, or team.  Do not fabricate anything not listed above.');
+  if (hasStaffBios) {
+    // Real, confirmed bug this prevents: the crawled website's own staff
+    // bios can name people who aren't in this tenant's actual bookable
+    // Team/Staff records (e.g. stale website content, or a demo site whose
+    // copy was never reconciled with the CRM). Without this line the model
+    // offers a website-bio name as if it were a real booking option, then
+    // has no real staffId to book them with.
+    lines.push('IMPORTANT: the names above are for answering informational questions only. They are NOT necessarily real, bookable staff. When actually booking an appointment, only ever offer/use department or staff names returned by the list_departments/list_doctors tools — never a name from this business profile block, even if it differs from what the tools return.');
+  }
   lines.push('=================================');
   return lines.join('\n');
 }
@@ -826,7 +939,14 @@ function formatLeadCaptureProgressContext(state: LeadCaptureState, booking?: Boo
   // the early-return below rather than folded into the same `known.length`
   // gate.
   const pausedBooking = !!booking?.confirmingSlot && !booking?.meetingCreated;
-  if (!known.length && !pausedBooking) return '';
+  // Same idea as pausedBooking above, for the department/doctor step
+  // instead of the slot step — a real, confirmed gap this fixes: the AI
+  // would ask "would you like to see Dr. X?" but nothing durable recorded
+  // which doctor was just suggested, so a bare "yes" reply had no state to
+  // resolve against and re-triggered list_departments/list_doctors from
+  // scratch instead of just proceeding with that doctor's staffId.
+  const offeredDoctorPending = !!booking?.offeredStaffId && !booking?.selectedStaffId;
+  if (!known.length && !pausedBooking && !offeredDoctorPending) return '';
 
   const missing: string[] = [];
   if (!state.firstName)             missing.push('name');
@@ -841,6 +961,11 @@ function formatLeadCaptureProgressContext(state: LeadCaptureState, booking?: Boo
     const label = booking?.confirmingSlot?.label;
     lines.push(
       `The visitor was mid-way through booking a meeting${label ? ` (they'd picked ${label})` : ''} when they asked this — answer their question first, then gently remind them and ask if they'd like to continue booking.`
+    );
+  }
+  if (offeredDoctorPending) {
+    lines.push(
+      `You just suggested ${booking!.offeredStaffName ?? 'a doctor'} (staffId=${booking!.offeredStaffId}) to the visitor. If they confirm in ANY way (e.g. "yes", "sure", "sounds good", "ok"), that means they accepted THIS doctor — proceed directly with staffId=${booking!.offeredStaffId} for check_meeting_availability, do NOT call list_departments or list_doctors again and do NOT ask which doctor a second time.`
     );
   }
   lines.push("Use this privately to decide what to ask next — ask only for what's marked STILL NEEDED, one thing at a time, never re-ask for something already known. Do NOT quote, paraphrase, format as a list, or otherwise reveal this note itself in your reply — just write a normal, natural sentence to the visitor.");
@@ -1061,9 +1186,57 @@ function formatDateTimeRange(start: Date, end: Date): string {
 // line of defense. Strips from the first leaked marker line onward (that
 // content is always trailing scaffolding, never the start of a reply).
 const LEAKED_PROGRESS_MARKER_RE = /\n{0,2}(?:={3,}\s*)?(?:INTERNAL NOTE|LEAD CAPTURE PROGRESS)[\s\S]*$/i;
+// Real, confirmed live bug: when the model's ENTIRE reply is nothing BUT
+// the leaked internal note (no real prose around it — e.g. a bare "LEAD
+// CAPTURE PROGRESS: STILL NEEDED: email or phone"), stripping the marker
+// leaves an empty string, and the old `|| text.trim()` fallback then
+// returned the ORIGINAL, UNSTRIPPED leaked text — the exact leak this
+// function exists to prevent, defeating itself in precisely the case that
+// matters most. A safe generic reply is correct here, not the raw text.
+const SAFE_FALLBACK_REPLY = "Sorry, could you tell me a bit more about what you need? I want to make sure I get you the right help.";
 function stripLeakedProgressNotes(text: string): string {
   const cleaned = text.replace(LEAKED_PROGRESS_MARKER_RE, '').trim();
-  return cleaned || text.trim();
+  return cleaned || SAFE_FALLBACK_REPLY;
+}
+
+/** Grounds the model's own "today"/"tomorrow" date math for
+ * check_meeting_availability's preferredDate — the backend's own date
+ * resolution (availability.service.ts) is authoritative regardless, this is
+ * just a low-risk anchor so the model's first guess is more often right. */
+function formatTodayForPrompt(timezone: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  }).format(new Date());
+}
+
+// Same "don't trust the LLM to self-police" philosophy as
+// stripLeakedProgressNotes() above — a real, confirmed production bug: the
+// general tool-calling path's small models can write confirmation-shaped
+// prose ("You're all set! I'll send a confirmation email.") even when
+// book_meeting was never actually called successfully THIS turn. The
+// deterministic booking-confirmation-shortcut never needs this guard — it
+// only ever emits this language after a REAL performBooking() success — so
+// this is applied only to the general LLM path's reply, right before it's
+// returned to a public visitor.
+// Real, confirmed gap this closes, twice over. First pass only matched
+// "booking is confirmed" / "appointment is confirmed|booked|scheduled" — it
+// missed "your MEETING is confirmed". Second pass added "meeting" but still
+// only matched NOUN-then-VERB order — it missed VERB-then-NOUN phrasing
+// ("I've confirmed your appointment"), caught live in a turn where the AI
+// fabricated a full confirmation with ZERO tool calls at all. Rather than
+// keep enumerating exact phrase shapes one at a time (a losing game against
+// a model that rephrases freely), this now matches on the co-occurrence of
+// any clear completion-verb ("confirmed"/"booked"/"scheduled", strict past
+// tense only — NOT "confirm"/"booking"/"scheduling", which show up
+// naturally in legitimate mid-flow replies like "let's get your booking
+// scheduled") with any real booking-noun, in either order, anywhere in the
+// reply.
+const CONFIRMATION_COMPLETION_VERB_RE = /\b(confirmed|booked|scheduled|all set|successfully booked)\b/i;
+const BOOKING_NOUN_RE = /\b(appointment|booking|meeting|reservation|visit|slot)\b/i;
+function guardAgainstHallucinatedConfirmation(text: string, meetingBookedThisTurn: boolean): string {
+  if (meetingBookedThisTurn) return text;
+  if (!(CONFIRMATION_COMPLETION_VERB_RE.test(text) && BOOKING_NOUN_RE.test(text))) return text;
+  return "I want to make sure that's actually booked before confirming it — let me check the details and get that finalized for you.";
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -1075,7 +1248,64 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
+/** Serializes turns for one session — text (POST /public/widget/chat) and
+ * continuous voice (the in-process LeadAgentLLM inside the worker) are two
+ * independent entry points into the real work below, and nothing stops both
+ * from processing a turn for the identical session at the same moment (a
+ * visitor speaking and typing within the same instant). Acquires a short-TTL
+ * Redis lock before doing any real work; a turn that can't acquire it within
+ * a few seconds gets a graceful "still working on your last message" reply
+ * instead of running concurrently with the one that's actually in flight —
+ * preventing duplicate AI replies, duplicate tool calls, and duplicate
+ * CRM writes from the rare exact-collision case. Crash recovery is the
+ * lock's own TTL, not this function: if the holder dies mid-turn, the lock
+ * self-expires and the next request simply acquires it, no explicit cleanup
+ * required. */
 export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
+  const { acquired, waitedMs } = await acquireTurnLock(input.tenantId, input.sessionId);
+
+  // Turn-lock-wait instrumentation — previously invisible. A real turn
+  // waiting a real amount of time to acquire the lock (whether it succeeds
+  // or ultimately times out) is exactly the queueing signal needed to tell
+  // "several genuinely serialized real turns stacking up" apart from "one
+  // abnormally slow call" when investigating a slow response.
+  if (waitedMs > 0) {
+    void backendClient.writeLog({
+      tenantId: input.tenantId, sessionId: input.sessionId,
+      event: 'turn_lock.wait', level: acquired ? 'info' : 'warn',
+      message: acquired ? 'Turn acquired the lock after waiting' : 'Turn rejected — lock still held after full poll window',
+      metadata: { waitedMs, acquired, channel: input.channel ?? 'text' },
+    });
+  }
+
+  if (!acquired) {
+    // Continuous voice only: suppress a repeated SPOKEN "still working"
+    // within a short window — a burst of near-simultaneous STT-final
+    // segments can legitimately collide on the lock several times in a row,
+    // and speaking the fallback every single time is far more disruptive
+    // over TTS than the same collision would be over text (which is fine
+    // getting one reply). Text/push-to-talk are unaffected — they always
+    // get the real fallback text, matching today's exact behavior.
+    if (input.channel === 'continuous_voice') {
+      const shouldSpeak = await shouldSpeakTurnLockFallback(input.tenantId, input.sessionId);
+      if (!shouldSpeak) {
+        return { response: '', escalate: false, capturedData: {} };
+      }
+    }
+    return {
+      response: "I'm still working on your last message — one moment, please.",
+      escalate: false,
+      capturedData: {},
+    };
+  }
+  try {
+    return await runBaseAgentInner(input);
+  } finally {
+    await releaseTurnLock(input.tenantId, input.sessionId);
+  }
+}
+
+async function runBaseAgentInner(input: AgentInput): Promise<AgentOutput> {
   try {
   // Public website-widget visitors (identified by visitorId) must never receive
   // live CRM-connector data (customer/deal/invoice records) — that stays exclusive
@@ -1085,6 +1315,16 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
   const stageStart = Date.now();
   let guardrailsMs = 0;
   let ragMs = 0;
+
+  // Abandoned-turn checkpoint #1 — a queued voice turn can sit behind
+  // acquireTurnLock() long enough that the visitor has already moved on by
+  // the time it's actually granted the lock. Bailing out here (before any
+  // guardrail/RAG/LLM work starts) means the lock is released immediately
+  // via runBaseAgent()'s own finally, rather than being held for a turn
+  // nobody's waiting on anymore.
+  if (input.abortSignal?.aborted) {
+    return { response: '', escalate: false, capturedData: {} };
+  }
 
   /* ── Rate limit ── */
   const rateCheck = await checkTenantRateLimit(input.tenantId);
@@ -1145,12 +1385,21 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       agentName:   input.agentName,
       language:    input.language,
     }),
-    getHistory(input.sessionId),
-    getCRMState(input.sessionId),
-    getLeadCaptureState(input.sessionId),
-    getBookingState(input.sessionId),
+    getHistory(input.tenantId, input.sessionId),
+    getCRMState(input.tenantId, input.sessionId),
+    getLeadCaptureState(input.tenantId, input.sessionId),
+    getBookingState(input.tenantId, input.sessionId),
   ]);
   const ragContext = ragResult.context;
+  // Hoisted above its original, later use (see toolHint computation further
+  // down) so checkFastPath's short-message guard below can also see it —
+  // one source of truth for "is a short reply expected right now" instead
+  // of two copies that could drift.
+  const hasActiveBookingFlow = !!bookingState && !bookingState.meetingCreated && !!(
+    bookingState.selectedTeamId || bookingState.selectedStaffId || bookingState.offeredStaffId
+    || bookingState.offeredSlots?.length || bookingState.confirmingSlot || bookingState.disambiguating
+    || bookingState.departmentsOffered
+  );
   const ragTopScore = ragResult.topScore;
 
   /* ── Content moderation result — checked here, after the concurrent fetch
@@ -1198,19 +1447,54 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
      would make extractCapturedData() inside the shortcut unable to ever
      recognise a real email or phone number. ── */
   if (isPublicVisitor) {
-    const shortcut = await tryBookingConfirmationShortcut(
+    // Department selection ("ss department") happens strictly EARLIER in
+    // the flow than slot confirmation — offeredSlots is never set until
+    // after a department (when required) is already resolved — so these
+    // two shortcuts' trigger windows never overlap. Checked first since
+    // it's the earlier stage.
+    const deptShortcut = await tryDepartmentSelectionShortcut(
       input.message,
-      { tenantId: input.tenantId, sessionId: input.sessionId, visitorId: input.visitorId, pageUrl: input.pageUrl },
+      {
+        tenantId: input.tenantId, sessionId: input.sessionId, visitorId: input.visitorId, pageUrl: input.pageUrl,
+        bookingRequireTeam: tenantConfig.bookingRequireTeam,
+      },
+      bookingState ?? {},
+    );
+    // Checked next, after department (earlier stage) and before booking-
+    // confirmation (later stage — picking one of ALREADY-offered slots):
+    // a visitor naming a new day ("Wednesday", "tomorrow") gets real
+    // availability fetched deterministically, with zero LLM/Groq dependency
+    // — see tryAvailabilityRequestShortcut's own comment for the real
+    // production timeout this closes.
+    const availabilityShortcut = deptShortcut.handled ? { handled: false } : await tryAvailabilityRequestShortcut(
+      input.message,
+      {
+        tenantId: input.tenantId, sessionId: input.sessionId, visitorId: input.visitorId, pageUrl: input.pageUrl,
+        bookingRequireTeam: tenantConfig.bookingRequireTeam,
+        bookingRequireService: tenantConfig.bookingRequireService,
+        bookingContactRequirement: tenantConfig.bookingContactRequirement,
+      },
+      bookingState ?? {},
+      leadCaptureState ?? {},
+    );
+    const shortcut = deptShortcut.handled ? deptShortcut : availabilityShortcut.handled ? availabilityShortcut : await tryBookingConfirmationShortcut(
+      input.message,
+      {
+        tenantId: input.tenantId, sessionId: input.sessionId, visitorId: input.visitorId, pageUrl: input.pageUrl,
+        bookingRequireTeam: tenantConfig.bookingRequireTeam,
+        bookingRequireService: tenantConfig.bookingRequireService,
+        bookingContactRequirement: tenantConfig.bookingContactRequirement,
+      },
       bookingState ?? {},
       leadCaptureState ?? {},
     );
     if (shortcut.handled && shortcut.response) {
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message,     timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: shortcut.response,  timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message,     timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: shortcut.response,  timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: shortcut.response });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: shortcut.response });
       logger.info('Deterministic booking-confirmation shortcut handled this turn (no LLM used)', { tenantId: input.tenantId, sessionId: input.sessionId });
       return { response: shortcut.response, escalate: false, capturedData: extractCapturedData(input.message) };
     }
@@ -1230,6 +1514,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     tenantConfig.hasConnectors && !isPublicVisitor,
     mergedQnaPairs,
     tenantConfig.websiteProfile,
+    hasActiveBookingFlow,
   );
   if (fast.handled && fast.response) {
     let fastResponse = fast.response;
@@ -1240,16 +1525,16 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       const leadState = leadCaptureState ?? {};
       if (!leadState.nudgeShown) {
         fastResponse += ' Would you like to book a time with our team, or is there anything else I can help with?';
-        await setLeadCaptureState(input.sessionId, { ...leadState, nudgeShown: true });
+        await setLeadCaptureState(input.tenantId, input.sessionId, { ...leadState, nudgeShown: true });
       }
     }
     // Persist to Redis + MongoDB so chat history is complete
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message,   timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: fastResponse,   timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message,   timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: fastResponse,   timestamp: Date.now() }),
     ]);
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: fastResponse });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: fastResponse });
     logger.info('Fast-path response (no LLM used)', { tenantId: input.tenantId, sessionId: input.sessionId, message: cleanMessage.slice(0, 60) });
     return { response: fastResponse, escalate: false, capturedData: extractCapturedData(input.message) };
   }
@@ -1268,12 +1553,37 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       void maybeCaptureWidgetLead(input, capturedNow);
       const reply = "Thanks for reaching out! Our AI assistant has reached its usage limit for now — please leave your name and email or phone number and our team will get back to you personally.";
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: reply,          timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: reply,          timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: reply });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: reply });
       logger.info('Tenant AI token quota exhausted — LLM reply blocked, lead capture still attempted', { tenantId: input.tenantId, sessionId: input.sessionId });
+      return { response: reply, escalate: false, capturedData: capturedNow };
+    }
+  }
+
+  /* ── Continuous-voice minutes-quota gate — same shape as the token-quota
+     gate above, a completely separate meter (LiveKit room-minutes), only
+     relevant for channel:'continuous_voice' turns. A text or push-to-talk
+     turn is never subject to this — those share the token budget above,
+     not this one. Real usage is only known once a session CLOSES (see
+     worker.ts), so this checks the tenant's PRIOR completed sessions this
+     month, not the in-progress one — a disclosed, coarser tradeoff than the
+     per-message token check. ── */
+  if (isPublicVisitor && input.channel === 'continuous_voice') {
+    const voiceQuota = await checkTenantVoiceMinutesQuota(input.tenantId, tenantConfig.monthlyVoiceMinutesLimit);
+    if (voiceQuota.blocked) {
+      const capturedNow = extractCapturedData(input.message);
+      void maybeCaptureWidgetLead(input, capturedNow);
+      const reply = "Thanks for calling! Our AI voice assistant has reached its usage limit for now — please share your name and email or phone number and our team will get back to you personally.";
+      await Promise.all([
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: reply,          timestamp: Date.now() }),
+      ]);
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: reply });
+      logger.info('Tenant continuous-voice minutes quota exhausted — LLM reply blocked, lead capture still attempted', { tenantId: input.tenantId, sessionId: input.sessionId });
       return { response: reply, escalate: false, capturedData: capturedNow };
     }
   }
@@ -1291,12 +1601,12 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
   // choke point further down). Guarding the read here too means a pre-existing
   // pendingIntent (e.g. still-live Redis state from before this fix shipped)
   // can never be acted on for a public session either.
-  const earlyPending = isPublicVisitor ? null : await getPendingIntent(input.sessionId);
+  const earlyPending = isPublicVisitor ? null : await getPendingIntent(input.tenantId, input.sessionId);
 
   /* ── Yes/No for reschedule confirmation ── */
   if (earlyPending?.pendingAction === 'await_reschedule_confirm') {
     if (AFFIRM_RE.test(cleanMessage.trim())) {
-      await clearPendingIntent(input.sessionId);
+      await clearPendingIntent(input.tenantId, input.sessionId);
       const startDate    = new Date(earlyPending.newStartIso!);
       const endDate      = new Date(earlyPending.newEndIso!);
       const dateRangeStr = formatDateTimeRange(startDate, endDate);
@@ -1338,28 +1648,28 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       ].filter(Boolean).join('\n');
 
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: rReply,         timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: rReply,         timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: rReply });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: rReply });
       return { response: rReply, escalate: false, capturedData: {} };
     }
 
     if (DENY_RE.test(cleanMessage.trim())) {
-      await clearPendingIntent(input.sessionId);
+      await clearPendingIntent(input.tenantId, input.sessionId);
       const cancelMsg = `No problem — **${earlyPending.existingTitle}** has not been changed. It stays on _${earlyPending.existingDateStr}_.`;
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: cancelMsg,       timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: cancelMsg,       timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: cancelMsg });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: cancelMsg });
       return { response: cancelMsg, escalate: false, capturedData: {} };
     }
     // User typed something else while a reschedule confirmation was pending —
     // clear the stale state and continue with normal flow
-    await clearPendingIntent(input.sessionId);
+    await clearPendingIntent(input.tenantId, input.sessionId);
   }
 
   /* ── Handle customer reply after meeting creation ── */
@@ -1369,14 +1679,14 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     if (!inlineEmail && AFFIRM_RE.test(parsedName.trim())) {
       const reask = `I still need to know who this meeting is with. Please share their **name** or **email address** so I can link them and send a confirmation.`;
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: reask,          timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: reask,          timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: reask });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: reask });
       return { response: reask, escalate: false, capturedData: {} };
     }
-    await clearPendingIntent(input.sessionId);
+    await clearPendingIntent(input.tenantId, input.sessionId);
 
     // Search CRM by clean name only (not the full "name + email" string)
     let awaitCustCustomer: CRMSearchResult | null = parsedName ? await fuzzyMatchContact(parsedName, input.tenantId) : null;
@@ -1449,11 +1759,11 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       : `I couldn't find **"${custInput}"** in your CRM. You can manually assign them from the Calendar. Or share their email address and I'll send the confirmation directly.`;
 
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: acReply,         timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: acReply,         timestamp: Date.now() }),
     ]);
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: acReply });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: acReply });
     return { response: acReply, escalate: false, capturedData: {} };
   }
 
@@ -1471,41 +1781,41 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
   }
 
   // Check if user is replying to a pending clarification question from previous turn
-  const pendingIntent = await getPendingIntent(input.sessionId);
+  const pendingIntent = await getPendingIntent(input.tenantId, input.sessionId);
   let resolvedPending: PendingIntent | null = null;
 
   if (pendingIntent) {
     const merged = mergePendingIntent(pendingIntent, chatIntent);
     if (merged.missingRequired.length === 0) {
       resolvedPending = merged;
-      await clearPendingIntent(input.sessionId);
+      await clearPendingIntent(input.tenantId, input.sessionId);
     } else {
       const question = merged.clarificationQuestion ?? `Could you provide the ${merged.missingRequired.join(' and ')}?`;
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: question,       timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: question,       timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: question });
-      await setPendingIntent(input.sessionId, merged);
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: question });
+      await setPendingIntent(input.tenantId, input.sessionId, merged);
       return { response: question, escalate: false, capturedData: {} };
     }
   } else if (chatIntent && chatIntent.confidence >= 0.75 && chatIntent.missingRequired.length > 0 &&
              (chatIntent.intent === 'schedule_meeting' || chatIntent.intent === 'reschedule_meeting')) {
     const question = chatIntent.clarificationQuestion ??
       `Could you provide the ${chatIntent.missingRequired.join(' and ')} for the ${chatIntent.intent.replace('_', ' ')}?`;
-    await setPendingIntent(input.sessionId, {
+    await setPendingIntent(input.tenantId, input.sessionId, {
       intent: chatIntent.intent,
       entities: chatIntent.entities,
       missingRequired: chatIntent.missingRequired,
       clarificationQuestion: chatIntent.clarificationQuestion,
     });
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: question,       timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: question,       timestamp: Date.now() }),
     ]);
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: question });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: question });
     return { response: question, escalate: false, capturedData: {} };
   }
 
@@ -1565,7 +1875,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
         : 'unknown time';
 
       // Ask for confirmation — don't update yet
-      await setPendingIntent(input.sessionId, {
+      await setPendingIntent(input.tenantId, input.sessionId, {
         intent:              'reschedule_meeting',
         entities:            activeEntities ?? { person: null, rawDateTime: null, meetingType: null, notes: null },
         missingRequired:     [],
@@ -1581,26 +1891,26 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
 
       const confirmAsk = `I found **"${existingMeeting.title}"** currently scheduled for _${existingDateStr}_.\n\nShould I reschedule it to **${dateRangeStr}**? Reply **yes** to confirm or **no** to cancel.`;
       await Promise.all([
-        appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-        appendMessage(input.sessionId, { role: 'assistant', content: confirmAsk,     timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+        appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: confirmAsk,     timestamp: Date.now() }),
       ]);
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: confirmAsk });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+      backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: confirmAsk });
       return { response: confirmAsk, escalate: false, capturedData: {} };
     }
 
     // No existing meeting found — inform user
     const noMeetingMsg = `I couldn't find an existing meeting${custName ? ` with "${customer?.displayName ?? custName}"` : ''} to reschedule. Would you like me to **create a new meeting** for **${dateRangeStr}** instead? Reply yes or no.`;
-    await setPendingIntent(input.sessionId, {
+    await setPendingIntent(input.tenantId, input.sessionId, {
       intent: 'reschedule_meeting', entities: activeEntities ?? { person: null, rawDateTime: null, meetingType: null, notes: null },
       missingRequired: [], clarificationQuestion: null,
     });
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: noMeetingMsg,  timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: noMeetingMsg,  timestamp: Date.now() }),
     ]);
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: noMeetingMsg });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: noMeetingMsg });
     return { response: noMeetingMsg, escalate: false, capturedData: {} };
   }
 
@@ -1751,7 +2061,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     let needsCustomerFollowUp = false;
     if (!customer) {
       // Store pending state so next message is treated as customer name/email
-      await setPendingIntent(input.sessionId, {
+      await setPendingIntent(input.tenantId, input.sessionId, {
         intent: 'schedule_meeting',
         entities: { person: null, rawDateTime: null, meetingType: null, notes: null },
         missingRequired: [], clarificationQuestion: null,
@@ -1767,11 +2077,11 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     const reply = replyParts.join('\n');
 
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: reply,          timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: reply,          timestamp: Date.now() }),
     ]);
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: reply });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: reply });
     void backendClient.logAIAction({
       tenantId:    input.tenantId,
       sessionId:   input.sessionId,
@@ -1793,11 +2103,11 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     const nameInfo = custName ? ` for ${custName}` : '';
     const confirmMsg = `I'll send a follow-up email${nameInfo}. ${templateInfo} Could you confirm their email address so I can send it right away?`;
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: confirmMsg,     timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: confirmMsg,     timestamp: Date.now() }),
     ]);
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'user',      content: input.message });
-    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: confirmMsg });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user',      content: input.message });
+    backendClient.saveChatMessage({ tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: confirmMsg });
     return { response: confirmMsg, escalate: false, capturedData: {} };
   }
 
@@ -1955,14 +2265,14 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
 
       // Cache for follow-up turns
       if (crmDataBlock || crmIntent.isCRMQuery) {
-        await setCRMState(input.sessionId, {
+        await setCRMState(input.tenantId, input.sessionId, {
           mode:         'crm',
           channel:      crmIntent.channel ?? crmIntent.explicitChannel,
           module:       crmIntent.module  ?? prevCRMState?.module,
           recordsBlock: crmDataBlock,
         });
       } else if (prevCRMState?.mode === 'crm') {
-        void setCRMState(input.sessionId, { mode: 'lead' });
+        void setCRMState(input.tenantId, input.sessionId, { mode: 'lead' });
       }
     }
   }
@@ -2000,7 +2310,7 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
   } else {
     // Lead capture / visitor mode
     systemContent = input.systemPrompt;
-    if (tenantConfig.systemPrompt) systemContent = tenantConfig.systemPrompt + '\n\n' + systemContent;
+    if (tenantConfig.systemPrompt) systemContent = truncate(tenantConfig.systemPrompt, MAX_TENANT_SYSTEM_PROMPT_CHARS) + '\n\n' + systemContent;
     if (!isPublicVisitor) {
       if (tenantConfig.crmContext)      systemContent += '\n\n' + tenantConfig.crmContext;
       if (tenantConfig.customerContext) systemContent += '\n\n' + tenantConfig.customerContext;
@@ -2009,13 +2319,57 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
         'You have tools available: search_website_knowledge (search this business\'s own site for an answer),',
         'check_meeting_availability (get REAL open times — never guess or invent times yourself),',
         'and book_meeting (confirm a booking on one of the times check_meeting_availability just returned).',
+        // Real, confirmed bug this closes: the model had no grounding for
+        // what "today"/"tomorrow" actually resolve to, so its own
+        // preferredDate computation for check_meeting_availability could be
+        // wrong even after the backend was fixed to actually honor a
+        // requested date. Small, low-risk addition — the backend's own
+        // date math is authoritative regardless, this just gives the model
+        // a real anchor for the YYYY-MM-DD it fills in.
+        `Today's real date, in this business's own timezone, is ${formatTodayForPrompt(tenantConfig.bookingTimezone)} — use this as the anchor for any relative date the visitor mentions ("today", "tomorrow", "next Monday", etc.) when filling in check_meeting_availability's preferredDate.`,
+        // Real, confirmed bug this closes: a visitor's very first "book an
+        // appointment" message was sometimes answered by asking for their
+        // name/email/phone before a single real time had ever been shown —
+        // nothing previously stated an order, and book_meeting's own old
+        // description read as license to ask for contact info any time it
+        // was missing. Strict, explicit order now spelled out.
+        // Tightened from a longer original — same guarantees (call the tool
+        // first, name real times with the date, never vague phrasing, never
+        // ask contact info early), fewer tokens per booking turn.
+        'Booking order: if no specific time is confirmed yet, your only move is to call check_meeting_availability and name the exact times it returns, including the date if not today (e.g. "Tomorrow we have 9 AM, 9:30 AM...") — never say a vague "which of these times", and never ask for name, email, or phone until a time is picked.',
+        'Only after the visitor has picked one of the real times you just listed do you ask for their name and contact info, so you can call book_meeting.',
+        // Real requirement: once a real time is confirmed and the visitor's
+        // name and required contact info are both known, call book_meeting
+        // immediately in that same reply — do not add an extra "would you
+        // like me to confirm that?" question and wait for a separate "yes"
+        // first. The visitor already said what they want; asking again just
+        // adds a redundant turn.
+        'Once a specific time is confirmed and you have the visitor\'s name and required contact info, call book_meeting right away — do not ask a separate "shall I confirm this?" question first and wait for another reply before booking.',
         'When a tool returns real data, base your reply directly on that data — do not ignore it or ask a generic clarifying question instead.',
         'After answering a factual question, naturally suggest a next step (booking a time, or asking if there\'s anything else) — without being pushy or repeating it if you already have.',
-        ...(tenantConfig.hasWidgetDepartments
+        'Never mention tool names, internal function names, APIs, or any internal system/processing details in your reply — the visitor should only ever see the natural-language result, never how you got it.',
+        // Real, confirmed gap: book_meeting's own tool result includes the
+        // real assigned staff member's name (so it can be shown when the
+        // visitor DID choose them), but for a tenant where the visitor never
+        // picked anyone, that name is purely an internal assignment detail —
+        // Team/Department/Staff selection and assignment are internal CRM
+        // concerns here, not something the visitor chose or asked about.
+        ...(tenantConfig.bookingRequireTeam
+          ? []
+          : ['When confirming a successful booking, never mention which staff member, team, or department was assigned — the visitor never chose one, so just confirm the date and time.']),
+        // Generic on purpose — LeadRyze serves hospitals, salons, law firms,
+        // real estate, sales teams, etc., not just medical practices. The
+        // tenant's own configurable staffLabel ("Doctor", "Stylist",
+        // "Consultant"...) substitutes wherever this used to hardcode
+        // "doctor". Gated on bookingRequireTeam, not hasWidgetDepartments
+        // directly, so a tenant can explicitly turn this step off even with
+        // teams visible in the widget (see Tenant.widget.booking.requireTeam).
+        ...(tenantConfig.bookingRequireTeam
           ? [
-              'This business has multiple departments/doctors. Before checking availability for a booking, call list_departments first.',
-              'If it returns real departments, ask the visitor which one, then call list_doctors for that department, ask which doctor they\'d like,',
-              'and pass that doctor\'s staffId into check_meeting_availability and book_meeting. If list_departments returns none, proceed exactly as normal.',
+              `This business has multiple departments/teams. Before checking availability for a booking, first find out what departments or ${tenantConfig.bookingStaffLabel}s this business has (taking into account anything the visitor already said about what they need) — never mention this lookup step itself to the visitor, just use its result.`,
+              `If there are real departments, ask the visitor which one, then find out which ${tenantConfig.bookingStaffLabel}s are in that department, ask which one they'd like,`,
+              `and use that ${tenantConfig.bookingStaffLabel}'s staffId when checking availability and booking. If there are no real departments, proceed exactly as normal.`,
+              `If the visitor does not express a preference (e.g. "whoever is soonest" or "I don't mind"), do not force a choice — proceed straight to check_meeting_availability with no staffId and let the business assign someone automatically.`,
             ]
           : []),
       ].join(' ');
@@ -2034,6 +2388,19 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
   // Append RAG knowledge base context
   if (ragContext) systemContent += '\n\n' + ragContext;
 
+  // Voice-specific behavior — confirmed as a real, previously-total gap:
+  // LeadAgentLLMStream bypasses chatCtx entirely and this shared
+  // system-prompt-assembly is the ONLY place voice ever gets any tailoring
+  // at all. Appended last (not woven in earlier) so it reads as the most
+  // emphasized, most-recent instruction rather than getting diluted by
+  // whatever else is above it. Reuses the SAME shared prompt-assembly path
+  // for text/push-to-talk/continuous-voice — no parallel VOICE_AGENT_PROMPT
+  // module, matching how this codebase already extends one pipeline for all
+  // three channels rather than forking.
+  if (input.channel === 'continuous_voice' || input.channel === 'push_to_talk') {
+    systemContent += '\n\n' + VOICE_CONVERSATION_INSTRUCTIONS;
+  }
+
   /* ── Build message array ── */
   const messages: LLMMessage[] = [
     { role: 'system', content: systemContent },
@@ -2049,25 +2416,81 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
   // set first; catalog and website are checked only once booking is ruled
   // out; no match leaves the full tool set bound, exactly as before this
   // narrowing existed.
+  // A real, confirmed gap: toolHint was computed purely from THIS turn's
+  // message text, with zero memory of an already-in-progress booking flow.
+  // A short, natural follow-up reply mid-flow ("ss department", "which
+  // team?") contains no booking keyword on its own, so toolHint fell back
+  // to undefined, all 7 tools bound, and the model could wander into
+  // search_website_knowledge instead of continuing list_doctors/
+  // check_meeting_availability — a real search that correctly finds
+  // nothing (topScore 0) then correctly-by-design triggers the
+  // low-confidence deflection, even though the visitor was mid-booking the
+  // whole time. Generic on purpose — not tuned to "doctor"/"department"
+  // wording, since a tenant's business type isn't assumed anywhere else in
+  // this file either. (hasActiveBookingFlow itself is now computed earlier,
+  // right after bookingState loads, so checkFastPath's short-message guard
+  // can also use it — see its declaration above.)
   const toolHint: ToolHint | undefined = !isPublicVisitor
     ? undefined
-    : isBookingOnlyMessage(cleanMessage)
+    : (isBookingOnlyMessage(cleanMessage) || hasActiveBookingFlow)
       ? 'booking'
       : isCatalogOnlyMessage(cleanMessage)
         ? 'catalog'
         : isWebsiteOnlyMessage(cleanMessage)
           ? 'website'
           : undefined;
-  const surfaceTools = getToolsForSurface(isPublicVisitor ? 'public_widget' : 'internal_staff', { toolHint });
+  // Hard gate, not just a prompt nudge: once a tenant has said "never ask
+  // about department" (bookingRequireTeam === false), the model physically
+  // cannot call list_departments/list_doctors — closes the gap where the
+  // prompt alone told it not to but the tools stayed bound anyway. Exempted
+  // once a team/staff is already resolved for this session, so a pick made
+  // before the setting changed (or a legitimate mid-flow correction) isn't
+  // stranded with no way to look up staff for a team it already knows.
+  const departmentToolsAllowed =
+    tenantConfig.bookingRequireTeam !== false || !!bookingState?.selectedTeamId || !!bookingState?.selectedStaffId;
+  // Same hard-gate reasoning, for the opposite end of the flow: a real,
+  // confirmed bug where the model asked for the visitor's name/contact info
+  // before ever showing a real available time — book_meeting's own
+  // description alone wasn't enough to stop it. Excluding the tool entirely
+  // until a real slot is on offer removes the temptation outright, on top
+  // of the reworded description and the explicit prompt ordering above.
+  const slotOffered = !!bookingState?.offeredSlots?.length;
+  const excludeNames = new Set<string>();
+  if (!departmentToolsAllowed) for (const name of DEPARTMENT_TOOL_NAMES) excludeNames.add(name);
+  if (!slotOffered) excludeNames.add('book_meeting');
+  const surfaceTools = getToolsForSurface(isPublicVisitor ? 'public_widget' : 'internal_staff', {
+    toolHint,
+    excludeNames: excludeNames.size ? excludeNames : undefined,
+  });
   let toolCallsLog: ToolCallLog[] = [];
   let responseUsage: UsageMetadata | undefined;
+
+  // Abandoned-turn checkpoint #2 — right before the single most expensive
+  // stage (the LLM call / tool loop, realistically ~10-20s and up to 90s
+  // worst-case). Guardrails/RAG above are comparatively fast, so this is the
+  // checkpoint that matters most: a visitor who spoke/typed again while
+  // those ran has this turn bail out here instead of still burning a full
+  // LLM+tool-loop cycle for a reply nobody will hear.
+  if (input.abortSignal?.aborted) {
+    return { response: '', escalate: false, capturedData: {} };
+  }
+
   const llmStart = Date.now();
+  let iterationTimingsMs: number[] = [];
+  let finalCallMs = 0;
   try {
     let responseContent: string;
     let responseProvider: string;
     let responseModel: string;
 
     if (surfaceTools.length) {
+      const isContinuousVoice = input.channel === 'continuous_voice';
+      // The one window where a streamed final call could speak a
+      // hallucinated confirmation before guardAgainstHallucinatedConfirmation
+      // below ever gets a chance to run — see runner.ts's own comment on
+      // deferStreamingForConfirmationRisk for why this specifically forces
+      // that one call to buffer instead of stream.
+      const hasActiveUnconfirmedBooking = !!bookingState?.offeredSlots?.length && !bookingState?.meetingCreated;
       const toolResult = await withTimeout(
         runToolLoop({
           messages,
@@ -2080,8 +2503,25 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
             pageUrl: input.pageUrl,
             companyName: tenantConfig.companyName,
             timezone: 'UTC',
+            rawMessage: input.message,
+            bookingRequireTeam: tenantConfig.bookingRequireTeam,
+            bookingRequireService: tenantConfig.bookingRequireService,
+            bookingContactRequirement: tenantConfig.bookingContactRequirement,
           },
           toolModelOverride: tenantConfig.toolModelPreset ? TOOL_MODEL_PRESETS[tenantConfig.toolModelPreset] : undefined,
+          onChunk: input.onChunk,
+          timeoutMs: isContinuousVoice ? VOICE_LLM_CALL_TIMEOUT_MS : TEXT_LLM_CALL_TIMEOUT_MS,
+          // Real evidence from live testing: text's OLD full chain (up to 4
+          // real calls, each up to 10s) produced genuine 40-60s worst cases
+          // — worse than intended when 10000ms/full-chain was first chosen
+          // for text. Reusing fastDegrade's short-chain STRUCTURE (single-
+          // attempt per call, skip the malformed-retry hop) for text too,
+          // while keeping text's own longer 10000ms timeoutMs (not voice's
+          // 6000ms) — caps text's worst case at ~20s (2 attempts) instead
+          // of ~40-60s (up to 4), without shortening the per-call budget
+          // that text was deliberately given more room on.
+          fastDegrade: true,
+          deferStreamingForConfirmationRisk: isContinuousVoice && hasActiveUnconfirmedBooking,
         }),
         TOOL_LOOP_TIMEOUT_MS,
         'LLM tool loop'
@@ -2091,6 +2531,20 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
       responseModel    = toolResult.model;
       toolCallsLog      = toolResult.toolCalls;
       responseUsage     = toolResult.usage;
+      iterationTimingsMs = toolResult.iterationTimingsMs;
+      finalCallMs         = toolResult.finalCallMs;
+    } else if (input.onChunk) {
+      // internal_staff has zero bound tools, so this call can never return a
+      // tool_call — unconditionally safe to stream, same reasoning as
+      // runToolLoop()'s own final call.
+      const onChunk = input.onChunk;
+      const streamStart = Date.now();
+      const streamedResult = await withTimeout(llm.generateStream(messages, onChunk), LLM_TIMEOUT_MS, 'LLM generate (streamed)');
+      responseContent  = streamedResult.content;
+      responseProvider = streamedResult.provider;
+      responseModel    = streamedResult.model;
+      responseUsage    = streamedResult.usage;
+      finalCallMs = Date.now() - streamStart;
     } else {
       const plainResult = await withTimeout(llm.generate(messages), LLM_TIMEOUT_MS, 'LLM generate');
       responseContent  = plainResult.content;
@@ -2102,6 +2556,10 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     const llmMs = Date.now() - llmStart;
     const result = { content: responseContent, provider: responseProvider, model: responseModel };
     let response = stripLeakedProgressNotes(result.content);
+    if (isPublicVisitor) {
+      const meetingBookedThisTurn = toolCallsLog.some((c) => c.name === 'book_meeting' && c.ok);
+      response = guardAgainstHallucinatedConfirmation(response, meetingBookedThisTurn);
+    }
     const estimatedCost = responseUsage
       ? estimateCostUsd(result.provider, result.model, responseUsage.input_tokens, responseUsage.output_tokens)
       : undefined;
@@ -2171,15 +2629,15 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
     const capturedData = capturedNow;
 
     await Promise.all([
-      appendMessage(input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
-      appendMessage(input.sessionId, { role: 'assistant', content: response,       timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'user',      content: input.message, timestamp: Date.now() }),
+      appendMessage(input.tenantId, input.sessionId, { role: 'assistant', content: response,       timestamp: Date.now() }),
     ]);
     backendClient.saveChatMessage({
-      tenantId: input.tenantId, sessionId: input.sessionId, role: 'user', content: input.message,
+      tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'user', content: input.message,
       visitorName: capturedNow.name, visitorEmail: capturedNow.email, visitorPhone: capturedNow.phone,
     });
     backendClient.saveChatMessage({
-      tenantId: input.tenantId, sessionId: input.sessionId, role: 'assistant', content: response,
+      tenantId: input.tenantId, sessionId: input.sessionId, channel: input.channel, visitorId: input.visitorId, role: 'assistant', content: response,
       metadata: { provider: result.provider, model: result.model },
       escalated: escalate || undefined,
     });
@@ -2214,7 +2672,19 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
         completionTokens: responseUsage?.output_tokens,
         totalTokens:      responseUsage?.total_tokens,
         estimatedCostUsd: estimatedCost,
-        stageTimingsMs:   { guardrails: guardrailsMs, moderation: moderationMs, rag: ragMs, llm: llmMs },
+        stageTimingsMs:   {
+          guardrails: guardrailsMs, moderation: moderationMs, rag: ragMs, llm: llmMs,
+          // total: previously missing — the sum every log reader had to
+          // recompute themselves (or couldn't, since llmMs alone doesn't
+          // include guardrails/moderation/RAG time preceding it).
+          total: guardrailsMs + moderationMs + ragMs + llmMs,
+          // Tool-loop iteration breakdown — previously invisible. Lets "3
+          // fast iterations + one slow final call" be told apart from "one
+          // abnormally slow iteration" instead of only seeing llmMs as one
+          // opaque total. Empty/0 for the plain llm.generate() path (no
+          // tool loop involved), which is itself informative.
+          iterationTimingsMs, finalCallMs,
+        },
         responseSource:     attemptedGrounding ? responseSource : undefined,
         responseConfidence: attemptedGrounding ? responseConfidence : undefined,
       },
@@ -2231,6 +2701,10 @@ export async function runBaseAgent(input: AgentInput): Promise<AgentOutput> {
         estimatedCostUsd: estimatedCost,
         responseSource:     attemptedGrounding ? responseSource : undefined,
         responseConfidence: attemptedGrounding ? responseConfidence : undefined,
+        // Named turnChannel, not channel — this object's CRM-query branch below
+        // already uses `channel` for an unrelated concept (which CRM connector
+        // e.g. 'zoho' a record came from), so this avoids colliding with it.
+        turnChannel: input.channel,
       };
 
       if (capturedNow.email || capturedNow.phone || capturedNow.name) {

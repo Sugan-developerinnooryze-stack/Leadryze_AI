@@ -15,7 +15,7 @@ export function extractCapturedData(userMessage: string): Record<string, string>
   if (phoneMatch) data.phone = phoneMatch[0].trim();
 
   const namePatterns = [
-    /(?:my name is|i am|i'm|call me)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
+    /(?:my name is|my name's|i am|i'm|call me)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
     /(?:name:\s*)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
   ];
   for (const p of namePatterns) {

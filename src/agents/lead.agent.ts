@@ -15,6 +15,16 @@ export interface LeadAgentInput {
    * chat.routes.ts's own comment on why this gates the lead-capture flow. */
   visitorId?: string;
   pageUrl?: string;
+  /** See AgentInput's own comment (base.agent.ts) — defaults to 'text' when
+   * omitted, so every existing caller (chat.routes.ts, voice.routes.ts) is
+   * unaffected; only the continuous-voice worker sets this explicitly. */
+  channel?: 'text' | 'push_to_talk' | 'continuous_voice';
+  /** See AgentInput's own comment (base.agent.ts) — only ever set by
+   * LeadAgentLLMStream, never by any other caller. */
+  abortSignal?: AbortSignal;
+  /** See AgentInput's own comment (base.agent.ts) — only ever set by
+   * LeadAgentLLMStream, never by any other caller. */
+  onChunk?: (delta: string) => void;
 }
 
 export interface LeadAgentOutput {
@@ -57,5 +67,8 @@ export async function runLeadAgent(input: LeadAgentInput): Promise<LeadAgentOutp
     language:    tenantConfig.language,
     visitorId:   input.visitorId,
     pageUrl:     input.pageUrl,
+    channel:     input.channel,
+    abortSignal: input.abortSignal,
+    onChunk:     input.onChunk,
   });
 }

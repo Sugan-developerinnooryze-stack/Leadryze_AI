@@ -46,9 +46,18 @@ export function classifyResponseConfidence(
   // Without this branch, these fall through to the ambient RAG score below,
   // which is 0 for any tenant that hasn't crawled their website yet —
   // incorrectly overriding a perfectly good booking answer with the
-  // low-confidence deflection message.
+  // low-confidence deflection message. list_departments/list_doctors are
+  // included here too — a real, confirmed bug found via live-fire testing:
+  // these are just as much "real, structured data was found" as
+  // check_meeting_availability/book_meeting (they return real department/
+  // doctor records), but were previously excluded, so a turn that only
+  // called list_departments (e.g. answering "what services do you
+  // provide?") fell through to the unrelated ambient RAG score and
+  // incorrectly triggered the low-confidence deflection even though a real
+  // tool call had just succeeded.
   const bookingHit = toolCallsLog.find(
-    (t) => (t.name === 'check_meeting_availability' || t.name === 'book_meeting') && t.ok
+    (t) => (t.name === 'check_meeting_availability' || t.name === 'book_meeting'
+      || t.name === 'list_departments' || t.name === 'list_doctors') && t.ok
   );
   if (bookingHit) return { source: 'booking', confidence: 0.9 };
 

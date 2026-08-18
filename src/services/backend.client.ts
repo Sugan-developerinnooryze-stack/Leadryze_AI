@@ -16,6 +16,10 @@ export interface TenantAIConfig {
   fallbackToHuman?: boolean;
   agentName?: string;
   monthlyTokenLimit?: number;
+  /** Monthly minute budget for CONTINUOUS voice conversations specifically
+   * (LiveKit room-minutes) — a separate meter from monthlyTokenLimit above.
+   * See tenant.model.ts's own field comment for the full rationale. */
+  monthlyVoiceMinutesLimit?: number;
   /** Which already-integrated LLM provider/model powers RAG/catalog/booking
    * tool-calling for this tenant specifically — undefined means "use the
    * global primary/fallback pair", today's unchanged default. See
@@ -114,6 +118,27 @@ export interface TenantContext {
     branding: TenantBranding;
     aiConfig: TenantAIConfig;
   };
+  /** Only the widget fields the continuous-voice worker needs — the
+   * deterministic session.say() greeting text, the per-call duration cap,
+   * and (now) the tenant's actual saved voice persona/language config,
+   * previously saved but never consumed by worker.ts's own Deepgram/
+   * Cartesia construction. Not the whole widget sub-document. */
+  widget?: {
+    greeting?: string;
+    voice?: {
+      maxSessionMinutes?: number;
+      allowTextDuringVoice?: boolean;
+      voiceName?: string;
+      sttLanguage?: string;
+      voicePreset?: {
+        provider: 'cartesia';
+        voiceId: string;
+        displayName: string;
+        gender: 'male' | 'female';
+        language: string;
+      };
+    };
+  };
   connectors: ConnectorSummary[];
   recentCustomers: CustomerSummary[];
   crmModules: Record<string, CRMModuleEntry[]>;
@@ -122,6 +147,18 @@ export interface TenantContext {
   qnaPairs: QnAPairSummary[];
   websiteProfile: WebsiteProfileSummary | null;
   hasWidgetDepartments: boolean;
+  /** Left undefined when the tenant has never explicitly configured it —
+   * see ResolvedTenantConfig's own comment for the `?? hasWidgetDepartments`
+   * fallback this enables. */
+  bookingRequireTeam?: boolean;
+  bookingRequireService?: boolean;
+  bookingRequireName: boolean;
+  bookingContactRequirement: 'email_only' | 'phone_only' | 'email_or_phone' | 'email_and_phone';
+  bookingStaffLabel: string;
+  /** IANA timezone the tenant's booking hours are configured in — used to
+   * ground the model's own "today"/"tomorrow" date math to the right
+   * calendar day (see base.agent.ts's booking prompt block). */
+  bookingTimezone: string;
 }
 
 export interface WidgetTeamSummary { teamId: string; name: string; }
@@ -234,11 +271,14 @@ class BackendClient {
     } catch { /* Security logging must never crash the agent */ }
   }
 
-  /** Persist a chat message to MongoDB. Fire-and-forget. */
+  /** Persist a chat message to MongoDB. Fire-and-forget.
+   * `channel` is only meaningful on a NEW session (backend's own
+   * $setOnInsert) — an existing session's channel never flips mid-conversation. */
   async saveChatMessage(params: {
     tenantId: string; sessionId: string; role: 'user' | 'assistant';
     content: string; metadata?: Record<string, unknown>;
-    visitorName?: string; visitorEmail?: string; visitorPhone?: string; escalated?: boolean;
+    visitorId?: string; visitorName?: string; visitorEmail?: string; visitorPhone?: string; escalated?: boolean;
+    channel?: 'text' | 'push_to_talk' | 'continuous_voice';
   }): Promise<void> {
     try {
       await this.http.post('/api/internal/chat-session', params);
@@ -276,6 +316,10 @@ class BackendClient {
     totalTokens: number;
     estimatedCostUsd: number;
     usedModerationFallback?: boolean;
+    sttSeconds?: number;
+    ttsCharacters?: number;
+    voiceCostUsd?: number;
+    isVoiceRequest?: boolean;
   }): Promise<void> {
     try {
       await this.http.post('/api/internal/ai-token-usage', params);
@@ -293,6 +337,34 @@ class BackendClient {
       return res.data.data.totalTokens;
     } catch (err) {
       logger.warn('BackendClient: getTenantTokenUsageThisMonth failed', { error: (err as Error).message, tenantId });
+      return 0;
+    }
+  }
+
+  /** Reports one COMPLETED continuous-voice session's real usage — called
+   * once by the voice-agent worker at session close (a separate, long-running
+   * process, not ai/'s Express app), same never-throws convention as
+   * trackAiTokenUsage above. */
+  async reportContinuousVoiceUsage(params: {
+    tenantId: string; minutes: number; deepgramSttSeconds: number;
+    cartesiaTtsCharacters: number; estimatedCostUsd: number;
+  }): Promise<void> {
+    try {
+      await this.http.post('/api/internal/continuous-voice-usage', params);
+    } catch (err) {
+      logger.warn('BackendClient: reportContinuousVoiceUsage failed', { error: (err as Error).message, tenantId: params.tenantId });
+    }
+  }
+
+  /** Month-to-date continuous-voice minutes used by a tenant — the source of
+   * truth checkTenantVoiceMinutesQuota() (rate-limiter.ts) briefly caches in
+   * Redis, same pattern as getTenantTokenUsageThisMonth() above. */
+  async getTenantVoiceMinutesUsageThisMonth(tenantId: string): Promise<number> {
+    try {
+      const res = await this.http.get<{ data: { minutes: number } }>(`/api/internal/continuous-voice-usage/${tenantId}`);
+      return res.data.data.minutes;
+    } catch (err) {
+      logger.warn('BackendClient: getTenantVoiceMinutesUsageThisMonth failed', { error: (err as Error).message, tenantId });
       return 0;
     }
   }
@@ -535,7 +607,14 @@ class BackendClient {
    * optional staffId narrows this to one chosen doctor's own availability,
    * for tenants using the department/doctor booking wizard. */
   async getWidgetAvailability(
-    tenantId: string, opts: { days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; staffId?: string } = {}
+    tenantId: string,
+    opts: {
+      days?: number; timeOfDay?: 'morning' | 'afternoon' | 'any'; staffId?: string; teamId?: string;
+      /** A visitor-requested calendar date, YYYY-MM-DD, resolved against the
+       * tenant's own timezone server-side — see internal.routes.ts's
+       * `/widget-availability` and availability.service.ts's own comments. */
+      date?: string;
+    } = {}
   ): Promise<Array<{ startIso: string; endIso: string; label: string }>> {
     try {
       const res = await this.http.get<{ data: { slots: Array<{ startIso: string; endIso: string; label: string }> } }>(
@@ -551,15 +630,18 @@ class BackendClient {
   /** Departments (Teams marked showInWidget:true) a visitor may choose
    * between when booking. Empty result reads as "no departments configured"
    * — proceed straight to availability, not an error. */
-  async getWidgetTeams(tenantId: string): Promise<Array<{ teamId: string; name: string }>> {
-    const cached = await getCachedWidgetTeams<Array<{ teamId: string; name: string }>>(tenantId);
+  async getWidgetTeams(tenantId: string, serviceHint?: string): Promise<Array<{ teamId: string; name: string }>> {
+    // serviceHint-filtered results are cached separately from the plain
+    // (unfiltered) list — different cache keys, no cross-contamination.
+    const cacheKey = serviceHint ? `${tenantId}:${serviceHint.toLowerCase()}` : tenantId;
+    const cached = await getCachedWidgetTeams<Array<{ teamId: string; name: string }>>(cacheKey);
     if (cached) return cached;
     try {
       const res = await this.http.get<{ data: { teams: Array<{ teamId: string; name: string }> } }>(
-        '/api/internal/widget-teams', { params: { tenantId } },
+        '/api/internal/widget-teams', { params: { tenantId, serviceHint } },
       );
       const teams = res.data.data?.teams ?? [];
-      void setCachedWidgetTeams(tenantId, teams);
+      void setCachedWidgetTeams(cacheKey, teams);
       return teams;
     } catch (err) {
       logger.warn('BackendClient: getWidgetTeams failed', { error: (err as Error).message, tenantId });

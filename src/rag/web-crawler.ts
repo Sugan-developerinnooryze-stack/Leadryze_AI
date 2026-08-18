@@ -23,15 +23,40 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024; // 2MB
 const USER_AGENT = 'LeadRyzeBot/1.0 (+https://leadryze.ai)';
 const BINARY_EXT_RE = /\.(pdf|jpg|jpeg|png|gif|svg|webp|ico|css|js|zip|mp4|mp3|woff2?|ttf|eot|xml|rss)$/i;
 
-async function fetchWithTimeout(url: string): Promise<Response> {
+// Real, confirmed cause of a real crawl failure: a target site on a free/
+// hobby hosting tier (e.g. Render) can be cold/asleep and answer with a
+// transient 502/503/504 — or the fetch itself can time out — on the very
+// first (seed) request, which previously abandoned the ENTIRE crawl with 0
+// pages, 0 chunks, no second chance. One bounded retry with a real wait
+// (long enough for a typical cold-start) fixes exactly this case, without
+// turning into a general retry framework — genuine, stable failures
+// (404, 403, DNS failure that persists) still fail after the one retry,
+// same as before.
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+const RETRY_DELAY_MS = 5000;
+
+async function fetchWithTimeout(url: string, attempt = 0): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    return await fetch(url, {
+    const res = await fetch(url, {
       signal: controller.signal,
       redirect: 'follow',
       headers: { 'User-Agent': USER_AGENT },
     });
+    if (RETRYABLE_STATUS.has(res.status) && attempt === 0) {
+      logger.warn('Crawler got a transient server error, retrying once', { url, status: res.status });
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      return fetchWithTimeout(url, attempt + 1);
+    }
+    return res;
+  } catch (err) {
+    if (attempt === 0) {
+      logger.warn('Crawler fetch failed, retrying once', { url, error: (err as Error).message });
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      return fetchWithTimeout(url, attempt + 1);
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }

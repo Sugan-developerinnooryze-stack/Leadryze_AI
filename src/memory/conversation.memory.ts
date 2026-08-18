@@ -53,38 +53,52 @@ function getRedis(): Redis | null {
 const TTL = 86400;
 const MAX_MESSAGES = 20;
 
-export async function getHistory(sessionId: string): Promise<ConversationMessage[]> {
+/** Every conversation-state key in this file is namespaced by BOTH tenantId
+ * and sessionId — sessionId alone used to be the sole key component, a real
+ * cross-tenant data-isolation gap (confirmed live: two different tenants'
+ * conversations sharing one sessionId shared the same Redis-backed state —
+ * history, CRM mode, lead-capture progress, booking selections — since
+ * nothing server-side enforces sessionId uniqueness/format beyond "non-empty
+ * string"; the widget's own crypto.randomUUID() generation is a client-side
+ * convention, not a server-enforced guarantee). Old, unscoped keys simply
+ * age out via their existing TTLs — no migration needed. */
+function scopedKey(prefix: string, tenantId: string, sessionId: string): string {
+  return `${prefix}:${tenantId}:${sessionId}`;
+}
+
+export async function getHistory(tenantId: string, sessionId: string): Promise<ConversationMessage[]> {
   const client = getRedis();
   if (!client) return [];
   try {
-    const raw = await client.get(`chat:hist:${sessionId}`);
+    const raw = await client.get(scopedKey('chat:hist', tenantId, sessionId));
     return raw ? (JSON.parse(raw) as ConversationMessage[]) : [];
   } catch (err) {
-    logger.warn('Could not fetch conversation history', { sessionId, error: (err as Error).message });
+    logger.warn('Could not fetch conversation history', { tenantId, sessionId, error: (err as Error).message });
     return [];
   }
 }
 
 export async function appendMessage(
+  tenantId: string,
   sessionId: string,
   message: ConversationMessage
 ): Promise<void> {
   const client = getRedis();
   if (!client) return;
   try {
-    const history = await getHistory(sessionId);
+    const history = await getHistory(tenantId, sessionId);
     history.push(message);
     const trimmed = history.slice(-MAX_MESSAGES);
-    await client.setex(`chat:hist:${sessionId}`, TTL, JSON.stringify(trimmed));
+    await client.setex(scopedKey('chat:hist', tenantId, sessionId), TTL, JSON.stringify(trimmed));
   } catch (err) {
-    logger.warn('Could not save conversation message', { sessionId, error: (err as Error).message });
+    logger.warn('Could not save conversation message', { tenantId, sessionId, error: (err as Error).message });
   }
 }
 
-export async function clearHistory(sessionId: string): Promise<void> {
+export async function clearHistory(tenantId: string, sessionId: string): Promise<void> {
   const client = getRedis();
   if (!client) return;
-  await client.del(`chat:hist:${sessionId}`);
+  await client.del(scopedKey('chat:hist', tenantId, sessionId));
 }
 
 /* ── CRM session state — remembers which module was last discussed ── */
@@ -95,20 +109,20 @@ export interface CRMSessionState {
   recordsBlock?: string; // Formatted records text injected into last response
 }
 
-export async function getCRMState(sessionId: string): Promise<CRMSessionState | null> {
+export async function getCRMState(tenantId: string, sessionId: string): Promise<CRMSessionState | null> {
   const client = getRedis();
   if (!client) return null;
   try {
-    const raw = await client.get(`chat:crm:${sessionId}`);
+    const raw = await client.get(scopedKey('chat:crm', tenantId, sessionId));
     return raw ? (JSON.parse(raw) as CRMSessionState) : null;
   } catch { return null; }
 }
 
-export async function setCRMState(sessionId: string, state: CRMSessionState): Promise<void> {
+export async function setCRMState(tenantId: string, sessionId: string, state: CRMSessionState): Promise<void> {
   const client = getRedis();
   if (!client) return;
   try {
-    await client.setex(`chat:crm:${sessionId}`, TTL, JSON.stringify(state));
+    await client.setex(scopedKey('chat:crm', tenantId, sessionId), TTL, JSON.stringify(state));
   } catch { /* non-critical */ }
 }
 
@@ -140,27 +154,27 @@ export interface PendingIntent {
 
 const PENDING_TTL = 300; // 5 minutes — discard if user doesn't reply
 
-export async function getPendingIntent(sessionId: string): Promise<PendingIntent | null> {
+export async function getPendingIntent(tenantId: string, sessionId: string): Promise<PendingIntent | null> {
   const client = getRedis();
   if (!client) return null;
   try {
-    const raw = await client.get(`chat:pending:${sessionId}`);
+    const raw = await client.get(scopedKey('chat:pending', tenantId, sessionId));
     return raw ? (JSON.parse(raw) as PendingIntent) : null;
   } catch { return null; }
 }
 
-export async function setPendingIntent(sessionId: string, intent: PendingIntent): Promise<void> {
+export async function setPendingIntent(tenantId: string, sessionId: string, intent: PendingIntent): Promise<void> {
   const client = getRedis();
   if (!client) return;
   try {
-    await client.setex(`chat:pending:${sessionId}`, PENDING_TTL, JSON.stringify(intent));
+    await client.setex(scopedKey('chat:pending', tenantId, sessionId), PENDING_TTL, JSON.stringify(intent));
   } catch { /* non-critical */ }
 }
 
-export async function clearPendingIntent(sessionId: string): Promise<void> {
+export async function clearPendingIntent(tenantId: string, sessionId: string): Promise<void> {
   const client = getRedis();
   if (!client) return;
-  try { await client.del(`chat:pending:${sessionId}`); } catch { /* non-critical */ }
+  try { await client.del(scopedKey('chat:pending', tenantId, sessionId)); } catch { /* non-critical */ }
 }
 
 /* ── Website widget lead-capture state — fields collected so far, across
@@ -188,20 +202,20 @@ export interface LeadCaptureState {
   nudgeShown?: boolean;
 }
 
-export async function getLeadCaptureState(sessionId: string): Promise<LeadCaptureState | null> {
+export async function getLeadCaptureState(tenantId: string, sessionId: string): Promise<LeadCaptureState | null> {
   const client = getRedis();
   if (!client) return null;
   try {
-    const raw = await client.get(`chat:lead:${sessionId}`);
+    const raw = await client.get(scopedKey('chat:lead', tenantId, sessionId));
     return raw ? (JSON.parse(raw) as LeadCaptureState) : null;
   } catch { return null; }
 }
 
-export async function setLeadCaptureState(sessionId: string, state: LeadCaptureState): Promise<void> {
+export async function setLeadCaptureState(tenantId: string, sessionId: string, state: LeadCaptureState): Promise<void> {
   const client = getRedis();
   if (!client) return;
   try {
-    await client.setex(`chat:lead:${sessionId}`, TTL, JSON.stringify(state));
+    await client.setex(scopedKey('chat:lead', tenantId, sessionId), TTL, JSON.stringify(state));
   } catch { /* non-critical */ }
 }
 
@@ -224,28 +238,53 @@ export interface BookingState {
   selectedTeamName?: string;
   selectedStaffId?: string;
   selectedStaffName?: string;
+  /** Set by list_doctors.tool.ts when a department has exactly ONE active
+   * doctor — the same "single-item-so-treat-as-implicitly-offered" pattern
+   * confirmingSlot/resolveSlot() already use for a single offered slot. A
+   * real, confirmed gap this fixes: the AI would ask "would you like to see
+   * Dr. X?", but nothing durable recorded WHICH doctor was just suggested —
+   * only the team was persisted — so a bare "yes" reply had no state to
+   * resolve against and re-triggered list_departments/list_doctors from
+   * scratch. Cleared once selectedStaffId is actually set. */
+  offeredStaffId?: string;
+  offeredStaffName?: string;
+  /** Set by list_departments.tool.ts the moment it returns a real
+   * department list — closes a gap the offeredStaffId fix above didn't
+   * cover: the visitor's reply picking a department (e.g. "ss department")
+   * comes BEFORE any team/staff field is set, so without this flag the
+   * booking-flow-continuation check in base.agent.ts had nothing to key
+   * off yet for that one turn, and the full 7-tool set stayed bound. */
+  departmentsOffered?: boolean;
   /** Set by the deterministic booking-confirmation shortcut the moment it
    * resolves a specific slot (by time, ordinal, or a bare affirmative with
    * only one slot offered) — so a LATER turn that only supplies contact
    * info (without restating the time) still knows which slot was already
    * confirmed. Cleared once meetingCreated is set. */
   confirmingSlot?: { startIso: string; endIso: string; label?: string };
+  /** Set by the deterministic shortcut when 2+ slots were offered and the
+   * visitor gave a bare affirmative ("sounds good") that's genuinely
+   * ambiguous among them — the shortcut asked "which time?" but (unlike the
+   * confirmingSlot branch above) previously never persisted this back to
+   * state at all, a real asymmetry: a follow-up turn had no record that a
+   * time-clarification question was still pending. Cleared once a specific
+   * slot is actually resolved. */
+  disambiguating?: boolean;
 }
 
-export async function getBookingState(sessionId: string): Promise<BookingState | null> {
+export async function getBookingState(tenantId: string, sessionId: string): Promise<BookingState | null> {
   const client = getRedis();
   if (!client) return null;
   try {
-    const raw = await client.get(`chat:booking:${sessionId}`);
+    const raw = await client.get(scopedKey('chat:booking', tenantId, sessionId));
     return raw ? (JSON.parse(raw) as BookingState) : null;
   } catch { return null; }
 }
 
-export async function setBookingState(sessionId: string, state: BookingState): Promise<void> {
+export async function setBookingState(tenantId: string, sessionId: string, state: BookingState): Promise<void> {
   const client = getRedis();
   if (!client) return;
   try {
-    await client.setex(`chat:booking:${sessionId}`, TTL, JSON.stringify(state));
+    await client.setex(scopedKey('chat:booking', tenantId, sessionId), TTL, JSON.stringify(state));
   } catch { /* non-critical */ }
 }
 
@@ -372,4 +411,86 @@ export async function setCrawlStatus(tenantId: string, status: WebsiteCrawlStatu
   try {
     await client.setex(`site:crawl:${tenantId}`, CRAWL_STATUS_TTL, JSON.stringify(status));
   } catch { /* non-critical */ }
+}
+
+// ── Per-session turn lock ──────────────────────────────────────────────────
+// Text (POST /public/widget/chat) and continuous voice (the in-process
+// LeadAgentLLM inside the worker) are two independent entry points into
+// runBaseAgent() — nothing without this guards against both processing a
+// turn for the identical session at the same moment (a visitor speaking and
+// typing within the same instant), which could otherwise produce two
+// overlapping AI replies or two near-simultaneous tool calls each believing
+// they're "the" call for that turn.
+const TURN_LOCK_TTL_MS = 60_000; // generous enough for this codebase's own documented worst-case tool-loop retry latency
+
+/** Attempts to atomically claim the lock for this session — `SET ... NX PX`
+ * either succeeds (lock acquired, returns true) or fails because another
+ * turn already holds it (returns false). If Redis itself is unavailable,
+ * fails OPEN (returns true, i.e. "proceed without serialization") — matching
+ * this whole file's own established fail-open posture everywhere else, since
+ * losing this guard under a Redis outage is a much smaller risk than
+ * blocking every single conversation. */
+async function tryAcquireTurnLock(tenantId: string, sessionId: string): Promise<boolean> {
+  const client = getRedis();
+  if (!client) return true;
+  try {
+    const result = await client.set(scopedKey('ai:turnlock', tenantId, sessionId), '1', 'PX', TURN_LOCK_TTL_MS, 'NX');
+    return result === 'OK';
+  } catch { return true; }
+}
+
+/** Polls briefly (not indefinitely) for the lock to free up — used when a
+ * turn is genuinely already in flight for this session, rather than
+ * rejecting the second turn outright. If the lock's own TTL expires while
+ * this is polling (the original holder crashed without ever reaching its
+ * `finally`), a later poll iteration will simply see the key gone and
+ * acquire it — recovery is the TTL itself, not any explicit cleanup the
+ * crashed process would have needed to run. Returns `{acquired:false}` if
+ * still locked after the whole poll window, in which case the caller
+ * returns a graceful "still working on your last message" reply instead of
+ * proceeding concurrently. `waitedMs` is real, previously-invisible
+ * queueing time — logged by the caller so a "why did this take 30-55s"
+ * question can be answered from data instead of guessed at (a burst of
+ * real, serialized turns each waiting out a slow predecessor looks very
+ * different in this number than one genuinely slow LLM call). */
+export async function acquireTurnLock(
+  tenantId: string, sessionId: string, maxWaitMs = 3000,
+): Promise<{ acquired: boolean; waitedMs: number }> {
+  const start = Date.now();
+  if (await tryAcquireTurnLock(tenantId, sessionId)) return { acquired: true, waitedMs: 0 };
+  const pollIntervalMs = 250;
+  const deadline = start + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    if (await tryAcquireTurnLock(tenantId, sessionId)) return { acquired: true, waitedMs: Date.now() - start };
+  }
+  return { acquired: false, waitedMs: Date.now() - start };
+}
+
+/** Continuous-voice-only suppression for the turn-lock's own spoken fallback
+ * ("I'm still working..."). A burst of near-simultaneous STT-final segments
+ * (e.g. a visitor pausing mid-sentence) can legitimately collide on the lock
+ * several times in a row — speaking the fallback out loud EVERY time is far
+ * more disruptive over TTS than the same collision would be over text.
+ * `SET NX PX` — the first collision in the window returns true (caller
+ * speaks the fallback and this marks the window); every collision within
+ * the next few seconds returns false (caller stays silent instead). Fails
+ * open (returns true) on a Redis outage, same posture as the turn lock
+ * itself — worst case under an outage is reverting to today's "speak every
+ * time" behavior, never a hard failure. */
+export async function shouldSpeakTurnLockFallback(tenantId: string, sessionId: string, windowMs = 8000): Promise<boolean> {
+  const client = getRedis();
+  if (!client) return true;
+  try {
+    const result = await client.set(scopedKey('ai:turnlock:fallback-said', tenantId, sessionId), '1', 'PX', windowMs, 'NX');
+    return result === 'OK';
+  } catch { return true; }
+}
+
+export async function releaseTurnLock(tenantId: string, sessionId: string): Promise<void> {
+  const client = getRedis();
+  if (!client) return;
+  try {
+    await client.del(scopedKey('ai:turnlock', tenantId, sessionId));
+  } catch { /* non-critical — the TTL will still expire it */ }
 }
