@@ -5,6 +5,7 @@ import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { ingestKnowledge, retrieveContext, deleteKnowledge } from '../rag/pipeline';
 import { ingestWebsite } from '../rag/website-ingest.service';
+import { indexDatasetBatch, deleteDatasetVersionVectors, searchDatasetRecords } from '../rag/dataset-index.service';
 import { getCrawlStatus } from '../memory/conversation.memory';
 import { logger } from '../utils/logger';
 
@@ -234,6 +235,81 @@ router.get('/knowledge/crawl-status', async (req: Request, res: Response) => {
   }
   const status = await getCrawlStatus(tenantId);
   return res.json({ success: true, data: status ?? { status: 'idle' } });
+});
+
+/**
+ * @swagger
+ * /knowledge/dataset-index-batch:
+ *   post:
+ *     summary: Embed + upsert one batch of Dataset records into Qdrant (Generic Dataset system)
+ *     description: |
+ *       Called synchronously by the backend's dataset ingestion loop, one
+ *       batch at a time (not fire-and-forget like /knowledge/crawl — the
+ *       backend needs the real indexed/failed counts back to update its own
+ *       DatasetVersion progress counters). Idempotent: safe to call again
+ *       for the same batch (e.g. resuming an interrupted ingestion) without
+ *       creating duplicate vectors.
+ */
+router.post('/knowledge/dataset-index-batch', async (req: Request, res: Response) => {
+  try {
+    const { tenantId, datasetId, datasetVersion, records } = req.body as {
+      tenantId: string; datasetId: string; datasetVersion: number;
+      records: Array<{ recordId: string; semanticText: string }>;
+    };
+    if (!tenantId || !datasetId || typeof datasetVersion !== 'number' || !Array.isArray(records)) {
+      return res.status(400).json({ success: false, message: 'tenantId, datasetId, datasetVersion, records[] required' });
+    }
+    const result = await indexDatasetBatch({ tenantId, datasetId, datasetVersion, records });
+    return res.json({ success: true, data: result });
+  } catch (err) {
+    logger.error('Dataset index batch error', { error: (err as Error).message });
+    return res.status(500).json({ success: false, message: 'Dataset batch indexing failed' });
+  }
+});
+
+/**
+ * @swagger
+ * /knowledge/dataset-index/{datasetId}/{version}:
+ *   delete:
+ *     summary: Delete all vectors for one Dataset version (failed-version cleanup)
+ */
+router.delete('/knowledge/dataset-index/:datasetId/:version', async (req: Request, res: Response) => {
+  try {
+    const { datasetId, version } = req.params;
+    const { tenantId } = req.query as { tenantId: string };
+    if (!tenantId) return res.status(400).json({ success: false, message: 'tenantId query param required' });
+    await deleteDatasetVersionVectors(tenantId, datasetId, Number(version));
+    return res.json({ success: true, message: 'Dataset version vectors deleted' });
+  } catch (err) {
+    logger.error('Dataset version vector cleanup error', { error: (err as Error).message });
+    return res.status(500).json({ success: false, message: 'Cleanup failed' });
+  }
+});
+
+/**
+ * @swagger
+ * /knowledge/dataset-search:
+ *   post:
+ *     summary: Semantic search within one tenant's one dataset's active version
+ *     description: |
+ *       Called by the query router's semantic executor (ai/src/query-router/)
+ *       — tenantId/datasetId/datasetVersion are always server-derived by the
+ *       caller from auth context, never taken from the LLM's own output.
+ */
+router.post('/knowledge/dataset-search', async (req: Request, res: Response) => {
+  try {
+    const { tenantId, datasetId, datasetVersion, query, limit } = req.body as {
+      tenantId: string; datasetId: string; datasetVersion: number; query: string; limit?: number;
+    };
+    if (!tenantId || !datasetId || typeof datasetVersion !== 'number' || !query) {
+      return res.status(400).json({ success: false, message: 'tenantId, datasetId, datasetVersion, query required' });
+    }
+    const results = await searchDatasetRecords(tenantId, datasetId, datasetVersion, query, limit);
+    return res.json({ success: true, data: { results } });
+  } catch (err) {
+    logger.error('Dataset search error', { error: (err as Error).message });
+    return res.status(500).json({ success: false, message: 'Dataset search failed' });
+  }
 });
 
 export default router;

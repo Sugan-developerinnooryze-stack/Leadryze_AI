@@ -51,6 +51,31 @@ export async function ensureCollection(
     });
     logger.info('Qdrant payload indexes created', { collectionName });
   }
+
+  // Generic Dataset system reuses this SAME collection (a `type:
+  // 'dataset_record'` payload value alongside the existing website-page
+  // type, not a second collection) — every field the Dataset system ever
+  // filters on (datasetId, datasetVersion, recordId — see
+  // dataset-index.service.ts's search/delete filters) needs its own index
+  // for the same reason `knowledgeId` did above: Qdrant returns a hard 400
+  // ("Index required but not found") for a filter on an unindexed field,
+  // not just a slow scan. Called unconditionally (not gated on `created`)
+  // since this collection already exists in production — `if (created)`
+  // above would never retroactively add these to it. try/catch per index
+  // since Qdrant errors on re-creating one that already exists; safe to
+  // ignore, matching this file's own graceful degradation style.
+  const datasetIndexes: Array<{ field_name: string; field_schema: 'keyword' | 'integer' }> = [
+    { field_name: 'datasetId', field_schema: 'keyword' },
+    { field_name: 'datasetVersion', field_schema: 'integer' },
+    { field_name: 'recordId', field_schema: 'keyword' },
+  ];
+  for (const idx of datasetIndexes) {
+    try {
+      await qdrant.createPayloadIndex(collectionName, idx);
+    } catch {
+      // Already exists — fine.
+    }
+  }
 }
 
 export async function upsertVectors(

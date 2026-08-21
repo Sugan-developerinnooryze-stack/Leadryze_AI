@@ -107,7 +107,7 @@ export async function buildRAGContext(query: string, tenantId: string): Promise<
     .map((c, i) => `[Source ${i + 1} — ${c.source}]\n${c.content}`)
     .join('\n\n---\n\n');
 
-  return `KNOWLEDGE BASE CONTEXT (use this to answer accurately — do not fabricate):\n\n${block}\n\nIf the answer is not found above, say you'll connect the customer with a human team member.`;
+  return `WEBSITE CONTEXT (use this to answer accurately — do not fabricate):\n\n${block}\n\nThis is website content only — it does not cover this business's uploaded product catalog or business-data records. If it doesn't fully answer the visitor's question, check search_dataset/search_products for this business's own records before concluding you can't help; only say you'll connect the customer with a human team member after those have genuinely come up empty too.`;
 }
 
 /** Same as buildRAGContext(), but also surfaces the top match's real
@@ -127,6 +127,6 @@ export async function buildRAGContextWithConfidence(
     .map((c, i) => `[Source ${i + 1} — ${c.source}]\n${c.content}`)
     .join('\n\n---\n\n');
 
-  const context = `KNOWLEDGE BASE CONTEXT (use this to answer accurately — do not fabricate):\n\n${block}\n\nIf the answer is not found above, say you'll connect the customer with a human team member.`;
+  const context = `WEBSITE CONTEXT (use this to answer accurately — do not fabricate):\n\n${block}\n\nThis is website content only — it does not cover this business's uploaded product catalog or business-data records. If it doesn't fully answer the visitor's question, check search_dataset/search_products for this business's own records before concluding you can't help; only say you'll connect the customer with a human team member after those have genuinely come up empty too.`;
   return { context, topScore: contexts[0].score };
 }

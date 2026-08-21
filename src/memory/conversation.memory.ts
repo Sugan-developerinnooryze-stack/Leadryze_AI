@@ -200,6 +200,43 @@ export interface LeadCaptureState {
    * already been shown this session — shown once, not appended to every
    * informational answer, to avoid feeling repetitive. */
   nudgeShown?: boolean;
+  /** Buying-intent / lead-score continuous-enrichment fields — see
+   * ai/src/agents/buying-intent.ts. `buyingIntent`/`leadScore` are merged
+   * "keep the highest-seen" across turns, same non-downgrade rule as
+   * email/phone above. `lastSent*` records what was last actually written
+   * to the backend Lead (at creation or a later enrichment call), so a
+   * later turn can detect a genuinely NEW upgrade worth another network
+   * call rather than re-sending on every turn. */
+  buyingIntent?: 'low' | 'medium' | 'high';
+  leadScore?:    number;
+  lastSentBuyingIntent?: 'low' | 'medium' | 'high';
+  /** What was last actually sent to the backend for requirement/interested-
+   * items, so the enrichment path only calls the backend again on a
+   * genuinely NEW value/item, not on every turn. */
+  lastSentRequirement?: string;
+  lastSentItemCount?: number;
+  /** Deterministic, verbatim capture of the visitor's own message — set
+   * whenever a requirement-shaped signal (quantity/application/need
+   * language) is detected, continuing to update AFTER the Lead has already
+   * been created (not gated on contact info still being missing). */
+  requirement?: string;
+  /** Deduplicated by datasetId+recordId, capped at 10 — every distinct item
+   * this session's search_dataset calls have surfaced, not just the last one.
+   * datasetVersion records WHICH version the visitor actually saw, since a
+   * re-upload can change price/specs under the same datasetId+recordId. */
+  interestedItems?: Array<{ datasetId: string; recordId: string; title: string; datasetVersion: number }>;
+  /** The single visitor message that triggered the session's highest
+   * buying-intent classification so far — the deterministic, cheap
+   * conversationSummary source (no LLM summarization call). */
+  conversationSummary?: string;
+  /** Set by request-quote-shortcut.ts the moment it asks "could I get your
+   * name and email?" after a Request Quote/Demo click — the item/topic name
+   * being quoted, so a FOLLOW-UP reply (e.g. a bare "John, john@x.com" with
+   * no "quote" wording at all) is still recognised as continuing this exact
+   * deterministic flow rather than falling through to the general LLM path.
+   * Cleared once contact info is captured (mirrors BookingState.
+   * confirmingSlot's own lifecycle). */
+  awaitingQuoteContactFor?: string;
 }
 
 export async function getLeadCaptureState(tenantId: string, sessionId: string): Promise<LeadCaptureState | null> {
@@ -216,6 +253,45 @@ export async function setLeadCaptureState(tenantId: string, sessionId: string, s
   if (!client) return;
   try {
     await client.setex(scopedKey('chat:lead', tenantId, sessionId), TTL, JSON.stringify(state));
+  } catch { /* non-critical */ }
+}
+
+/** Per-session, per-dataset record of which recordIds have already been
+ * surfaced as item cards via search_dataset — fixes a real gap where "Show
+ * more" had no way to avoid re-showing the same top-N results. Flat/global
+ * per dataset rather than keyed by exact query text, since a visitor who's
+ * already seen a record doesn't need to see it again even from a differently
+ * worded later question. Capped per-dataset so a very long browsing session
+ * doesn't grow this unboundedly. */
+export interface DatasetBrowseState {
+  [datasetId: string]: string[];
+}
+
+const BROWSE_STATE_CAP_PER_DATASET = 50;
+
+export async function getDatasetBrowseState(tenantId: string, sessionId: string): Promise<DatasetBrowseState> {
+  const client = getRedis();
+  if (!client) return {};
+  try {
+    const raw = await client.get(scopedKey('chat:browse', tenantId, sessionId));
+    return raw ? (JSON.parse(raw) as DatasetBrowseState) : {};
+  } catch { return {}; }
+}
+
+/** Appends newly-shown recordIds for one dataset, deduplicated and capped —
+ * caller passes only the NEW ids just surfaced this turn, not the full list. */
+export async function appendDatasetBrowseState(
+  tenantId: string, sessionId: string, datasetId: string, newRecordIds: string[],
+): Promise<void> {
+  if (!newRecordIds.length) return;
+  const client = getRedis();
+  if (!client) return;
+  try {
+    const state = await getDatasetBrowseState(tenantId, sessionId);
+    const existing = state[datasetId] ?? [];
+    const merged = Array.from(new Set([...existing, ...newRecordIds])).slice(-BROWSE_STATE_CAP_PER_DATASET);
+    state[datasetId] = merged;
+    await client.setex(scopedKey('chat:browse', tenantId, sessionId), TTL, JSON.stringify(state));
   } catch { /* non-critical */ }
 }
 

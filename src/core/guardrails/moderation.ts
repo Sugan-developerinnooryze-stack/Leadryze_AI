@@ -11,6 +11,23 @@ import { localModerationFallback } from './local-moderation-fallback';
 // here is what makes the local fallback actually fast.
 const openai = new OpenAI({ apiKey: config.openai.apiKey, timeout: 6000, maxRetries: 0 });
 
+/** Short-lived, in-memory circuit breaker — real, confirmed latency waste
+ * this closes: every single chat turn was paying for a real network round-
+ * trip to OpenAI's moderation endpoint, which is currently GUARANTEED to
+ * fail (zero OpenAI billing credits, confirmed this session), before ever
+ * falling back locally. After a few consecutive real failures, skip the
+ * live call entirely for a cooldown window and go straight to the local
+ * fallback — self-heals automatically once the cooldown expires (no manual
+ * re-enable needed), so this recovers on its own the moment credits are
+ * added or OpenAI's endpoint recovers, rather than staying permanently
+ * bypassed. Process-local (module-level state, not Redis) — the worst case
+ * of a restart resetting this is a few more real attempts, never a
+ * correctness issue, since the local fallback is always safe to use. */
+const BREAKER_FAILURE_THRESHOLD = 3;
+const BREAKER_COOLDOWN_MS = 5 * 60 * 1000;
+let consecutiveFailures = 0;
+let breakerOpenUntil = 0;
+
 export interface ModerationResult {
   safe: boolean;
   flagged: boolean;
@@ -27,6 +44,11 @@ export async function moderateContent(text: string): Promise<ModerationResult> {
     return { safe: true, flagged: false, categories: {} };
   }
 
+  if (Date.now() < breakerOpenUntil) {
+    const fallback = localModerationFallback(text);
+    return { ...fallback, usedFallback: true };
+  }
+
   try {
     const response = await openai.moderations.create({ input: text });
     const result = response.results[0];
@@ -38,6 +60,7 @@ export async function moderateContent(text: string): Promise<ModerationResult> {
       });
     }
 
+    consecutiveFailures = 0;
     return {
       safe: !result.flagged,
       flagged: result.flagged,
@@ -52,6 +75,13 @@ export async function moderateContent(text: string): Promise<ModerationResult> {
     // every message tenant-wide (the prior fail-closed behavior silently took the whole
     // chatbot down during any moderation-API outage). Prompt-injection, PII, and rate-limit
     // guardrails are unaffected — they're separate stages that keep running regardless.
+    consecutiveFailures++;
+    if (consecutiveFailures >= BREAKER_FAILURE_THRESHOLD) {
+      breakerOpenUntil = Date.now() + BREAKER_COOLDOWN_MS;
+      logger.warn('Moderation API failing repeatedly — skipping live calls for a cooldown window', {
+        consecutiveFailures, cooldownMs: BREAKER_COOLDOWN_MS,
+      });
+    }
     logger.warn('Moderation API unavailable — using local fallback check', { error: (err as Error).message });
     const fallback = localModerationFallback(text);
     return { ...fallback, usedFallback: true };

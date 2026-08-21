@@ -59,13 +59,23 @@ export async function ingestWebsite(opts: {
   const { tenantId, startUrl, maxPages = 20 } = opts;
 
   await setCrawlStatus(tenantId, { status: 'running', startedAt: Date.now() });
+  // Persisted (not just the ephemeral Redis status above) — the instant a
+  // reload happens mid-crawl, even from a different tab/session, the
+  // tenant doc itself already reads 'crawling' with reset current-run
+  // counters, not a previous run's stale numbers.
+  await backendClient.startWebsiteCrawl(tenantId);
   const catalogSyncStart = Date.now();
   const knowledgeSourceId = await backendClient.startCatalogKnowledgeSource(tenantId, 'website', startUrl);
 
   try {
     const { pages, failures } = await crawlWebsite(startUrl, { maxDepth: 2, maxPages });
 
+    // pagesIndexed only counts a page once its chunks are ACTUALLY upserted
+    // to Qdrant — pages.length alone (the old "pages indexed" label) only
+    // means "cheerio extracted >=40 chars of text," which says nothing
+    // about whether the embed step itself succeeded.
     let chunksIngested = 0;
+    let pagesIndexed = 0;
     for (const page of pages) {
       const id = stableKnowledgeId(tenantId, page.url);
       try {
@@ -79,6 +89,7 @@ export async function ingestWebsite(opts: {
           metadata: { sourceUrl: page.url, crawledAt: new Date().toISOString() },
         });
         chunksIngested += result.chunksIngested;
+        pagesIndexed++;
       } catch (err) {
         failures.push({ url: page.url, reason: (err as Error).message });
       }
@@ -109,6 +120,16 @@ export async function ingestWebsite(opts: {
     }
 
     const result: IngestWebsiteResult = { pagesCrawled: pages.length, chunksIngested, failures };
+    // pagesFailed = pages that were actually fetched (part of pagesCrawled)
+    // but failed to embed/upsert — distinct from URLs that never made it
+    // into `pages` at all (those aren't "crawled," so they don't count
+    // against this tenant's indexing status). 'failed' is reserved for
+    // zero usable content; most-succeeded-some-didn't is a warning, not a
+    // failure — a 100-page site shouldn't read as broken over 2 bad pages.
+    const pagesFailed = pages.length - pagesIndexed;
+    const status: 'ready' | 'ready_with_warnings' | 'failed' =
+      pagesIndexed === 0 ? 'failed' : pagesFailed > 0 ? 'ready_with_warnings' : 'ready';
+
     await setCrawlStatus(tenantId, {
       status: 'completed',
       startedAt: Date.now(),
@@ -117,11 +138,13 @@ export async function ingestWebsite(opts: {
       chunksIngested: result.chunksIngested,
       failures: result.failures,
     });
-    await backendClient.recordWebsiteCrawlResult(tenantId, result.pagesCrawled);
+    await backendClient.recordWebsiteCrawlResult(tenantId, {
+      pagesCrawled: result.pagesCrawled, pagesIndexed, pagesFailed, chunksIndexed: chunksIngested, status,
+    });
     if (knowledgeSourceId) {
       await backendClient.finishCatalogKnowledgeSource(knowledgeSourceId, 'completed', Date.now() - catalogSyncStart);
     }
-    logger.info('Website ingestion complete', { tenantId, startUrl, ...result, failureCount: failures.length });
+    logger.info('Website ingestion complete', { tenantId, startUrl, ...result, pagesIndexed, pagesFailed, status });
     return result;
   } catch (err) {
     await setCrawlStatus(tenantId, {
@@ -129,6 +152,14 @@ export async function ingestWebsite(opts: {
       startedAt: Date.now(),
       finishedAt: Date.now(),
       error: (err as Error).message,
+    });
+    // A total failure (crawl never produced any pages at all) still needs
+    // to clear the persisted 'crawling' state set at the top of this
+    // function — otherwise a tenant that hits this path is stuck showing
+    // "Crawling…" forever on reload, since nothing else would ever move it
+    // off that state.
+    await backendClient.recordWebsiteCrawlResult(tenantId, {
+      pagesCrawled: 0, pagesIndexed: 0, pagesFailed: 0, chunksIndexed: 0, status: 'failed',
     });
     if (knowledgeSourceId) {
       await backendClient.finishCatalogKnowledgeSource(knowledgeSourceId, 'failed', Date.now() - catalogSyncStart, (err as Error).message);

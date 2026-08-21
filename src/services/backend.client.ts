@@ -8,6 +8,7 @@ import {
   getCachedWidgetTeams, setCachedWidgetTeams,
   getCachedWidgetStaff, setCachedWidgetStaff,
 } from '../memory/conversation.memory';
+import type { QueryPlan, DatasetSchemaContext } from '../query-router/types';
 
 /* ── Types matching the backend's internal endpoint response ── */
 export interface TenantAIConfig {
@@ -42,6 +43,11 @@ export interface TenantSettings {
 
 export interface CatalogSearchResult {
   _id: string; title: string; sku?: string; category?: string; subCategory?: string; shortDescription?: string;
+  /** Key-normalized (e.g. "estimated_price_amount_inr"), whatever the
+   * tenant's own source columns happened to be — search_products scans
+   * this for anything price-shaped so a broad browse/price-range question
+   * can be answered without a separate get_product_details call per item. */
+  specifications?: Record<string, string>;
 }
 export interface CatalogItemDetail extends CatalogSearchResult {
   longDescription?: string; specifications?: Record<string, string>; attributes?: Record<string, string>;
@@ -574,6 +580,9 @@ class BackendClient {
   async createLeadFromWidget(params: {
     tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
     firstName: string; lastName?: string; email?: string; phone?: string; company?: string; service?: string;
+    leadScore?: number; buyingIntent?: 'low' | 'medium' | 'high';
+    interestedItems?: Array<{ datasetId: string; recordId: string; title: string; datasetVersion: number }>;
+    requirement?: string; conversationSummary?: string;
   }): Promise<{ success: boolean; leadId?: string; leadDisplayId?: string; alreadyCreated?: boolean }> {
     try {
       const res = await this.http.post<{ data: { leadId: string; leadDisplayId?: string; alreadyCreated?: boolean } }>(
@@ -586,16 +595,49 @@ class BackendClient {
     }
   }
 
-  /** Records the outcome of a website crawl onto the tenant's own widget
-   * config (lastCrawledAt/crawlPageCount) — these are deliberately NOT in
-   * updateTenant()'s client-editable field allow-list (a caller shouldn't be
-   * able to just claim "I crawled N pages" via the generic tenant-update
-   * endpoint); this internal, service-key-gated route is the only path that
-   * can set them, matching the same "AI service is the source of truth for
-   * what it actually did" pattern createLeadFromWidget() above already uses. */
-  async recordWebsiteCrawlResult(tenantId: string, pagesCrawled: number): Promise<void> {
+  /** Enriches an ALREADY-CREATED Lead as buying intent increases later in
+   * the same session — never creates a second Lead, only updates the one
+   * `leadId` already anchors (see base.agent.ts's continuous-enrichment
+   * comment on why score/rating aren't a frozen creation-time snapshot). */
+  async updateLeadFromWidget(tenantId: string, leadId: string, params: {
+    leadScore?: number; buyingIntent?: 'low' | 'medium' | 'high';
+    interestedItems?: Array<{ datasetId: string; recordId: string; title: string; datasetVersion: number }>;
+    requirement?: string; conversationSummary?: string;
+  }): Promise<{ success: boolean }> {
     try {
-      await this.http.post('/api/internal/widget-crawl-complete', { tenantId, pagesCrawled });
+      await this.http.patch(`/api/internal/widget-lead-update/${leadId}`, { tenantId, ...params });
+      return { success: true };
+    } catch (err) {
+      logger.warn('BackendClient: updateLeadFromWidget failed', { error: (err as Error).message, tenantId, leadId });
+      return { success: false };
+    }
+  }
+
+  /** These two calls record a website crawl's lifecycle onto the tenant's
+   * own widget config — deliberately NOT in updateTenant()'s client-editable
+   * field allow-list (a caller shouldn't be able to just claim "I crawled N
+   * pages" via the generic tenant-update endpoint); these internal,
+   * service-key-gated routes are the only path that can set them, matching
+   * the same "AI service is the source of truth for what it actually did"
+   * pattern createLeadFromWidget() above already uses. */
+  /** Called the instant a crawl begins — sets crawlStatus:'crawling' and
+   * resets the current-run counters immediately, so a page reload mid-crawl
+   * never shows a previous run's numbers as though they're the current
+   * one. See internal.routes.ts's widget-crawl-start for the full doc. */
+  async startWebsiteCrawl(tenantId: string): Promise<void> {
+    try {
+      await this.http.post('/api/internal/widget-crawl-start', { tenantId });
+    } catch (err) {
+      logger.warn('BackendClient: startWebsiteCrawl failed', { error: (err as Error).message, tenantId });
+    }
+  }
+
+  async recordWebsiteCrawlResult(tenantId: string, result: {
+    pagesCrawled: number; pagesIndexed: number; pagesFailed: number;
+    chunksIndexed: number; status: 'ready' | 'ready_with_warnings' | 'failed';
+  }): Promise<void> {
+    try {
+      await this.http.post('/api/internal/widget-crawl-complete', { tenantId, ...result });
     } catch (err) {
       logger.warn('BackendClient: recordWebsiteCrawlResult failed', { error: (err as Error).message, tenantId });
     }
@@ -676,6 +718,13 @@ class BackendClient {
     tenantId: string; sessionId: string; visitorId?: string; sourceUrl?: string;
     startIso: string; endIso: string; firstName: string; lastName?: string; email?: string; phone?: string; topic?: string;
     staffId?: string;
+    // Booking-parity fields (Product Cards / lead-gen phase) — a visitor who
+    // reaches high buying intent and books directly (never going through a
+    // separate "Request Quote" turn) must get the same rich Lead as the
+    // plain capture path, not an impoverished booking-only record.
+    leadScore?: number; buyingIntent?: 'low' | 'medium' | 'high';
+    interestedItems?: Array<{ datasetId: string; recordId: string; title: string; datasetVersion: number }>;
+    requirement?: string; conversationSummary?: string;
   }): Promise<{ success: boolean; meetingId?: string; staffName?: string; leadId?: string; alreadyCreated?: boolean; error?: string; reason?: 'slot_taken' }> {
     try {
       const res = await this.http.post<{ data: { meetingId: string; staffName?: string; leadId: string; alreadyCreated?: boolean } }>(
@@ -691,6 +740,77 @@ class BackendClient {
       // silently break this.
       const reason = err?.response?.status === 409 ? ('slot_taken' as const) : undefined;
       return { success: false, error: message, reason };
+    }
+  }
+
+  /* ── Generic Dataset system (search_dataset / get_dataset_record) ──── */
+
+  /** Every dataset this tenant has enabled for the widget — search_dataset
+   * uses this to resolve a datasetId (or offer a choice) since the model is
+   * never told one in advance. */
+  async listDatasetsForChatbot(tenantId: string): Promise<Array<{ datasetId: string; name: string }>> {
+    try {
+      const res = await this.http.get<{ data: { datasets: Array<{ datasetId: string; name: string }> } }>(
+        '/api/internal/datasets', { params: { tenantId } },
+      );
+      return res.data.data?.datasets ?? [];
+    } catch (err) {
+      logger.warn('BackendClient: listDatasetsForChatbot failed', { error: (err as Error).message, tenantId });
+      return [];
+    }
+  }
+
+  /** The column/role schema for one dataset — feeds the query router's
+   * fast-path/classifier so a plan only ever references real fields. */
+  async getDatasetSchema(tenantId: string, datasetId: string): Promise<DatasetSchemaContext['columns']> {
+    try {
+      const res = await this.http.get<{ data: { columns: DatasetSchemaContext['columns'] } }>(
+        `/api/internal/datasets/${datasetId}/schema`, { params: { tenantId } },
+      );
+      return res.data.data?.columns ?? [];
+    } catch (err) {
+      logger.warn('BackendClient: getDatasetSchema failed', { error: (err as Error).message, tenantId, datasetId });
+      return [];
+    }
+  }
+
+  /** Same call target as getDatasetSchema — helper name kept for tool
+   * readability where the caller specifically needs the normalizedName ->
+   * originalName relabel map (hardening Gap 5), not the query-router shape. */
+  buildDatasetLabelMap(columns: DatasetSchemaContext['columns']): Map<string, string> {
+    return new Map(columns.map((c) => [c.normalizedName, c.originalName]));
+  }
+
+  /** Executes a QueryPlan the query router built — tenantId/datasetId are
+   * passed as explicit top-level params here (never read out of `plan`
+   * itself, which structurally has no such fields — see query-router/types.ts),
+   * mirroring executeDatasetQuery()'s own signature on the backend side. */
+  async executeDatasetQuery(
+    tenantId: string, datasetId: string, plan: QueryPlan,
+  ): Promise<{ results: Array<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number }>; count?: number; datasetName: string | null }> {
+    try {
+      const res = await this.http.post<{ data: { results: Array<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number }>; count?: number; datasetName: string | null } }>(
+        '/api/internal/datasets/query', { tenantId, datasetId, plan },
+      );
+      return res.data.data ?? { results: [], datasetName: null };
+    } catch (err) {
+      logger.warn('BackendClient: executeDatasetQuery failed', { error: (err as Error).message, tenantId, datasetId });
+      return { results: [], datasetName: null };
+    }
+  }
+
+  /** get_dataset_record tool's backing call — exact-record lookup by id. */
+  async getDatasetRecord(
+    tenantId: string, datasetId: string, recordId: string,
+  ): Promise<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number } | null> {
+    try {
+      const res = await this.http.get<{ data: { record: { recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number } | null } }>(
+        `/api/internal/datasets/${datasetId}/record/${encodeURIComponent(recordId)}`, { params: { tenantId } },
+      );
+      return res.data.data?.record ?? null;
+    } catch (err) {
+      logger.warn('BackendClient: getDatasetRecord failed', { error: (err as Error).message, tenantId, datasetId, recordId });
+      return null;
     }
   }
 

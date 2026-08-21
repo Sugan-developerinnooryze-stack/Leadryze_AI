@@ -40,7 +40,7 @@ const BARE_AFFIRMATIVES = new Set([
  * "sure"/"ok"/"perfect" are just as name-shaped and just as wrong to accept
  * as a name once resolveSlot() itself isn't the one consuming them (that
  * only happens when a slot isn't already confirmingSlot — see below). */
-const NON_NAME_WORDS = new Set([
+export const NON_NAME_WORDS = new Set([
   ...BARE_AFFIRMATIVES,
   'hi', 'hello', 'hey', 'hmm', 'hm', 'um', 'uh', 'no', 'nope', 'nah', 'maybe',
   'nice', 'cool', 'wow', 'great', 'thanks', 'thank you', 'welcome',
@@ -54,7 +54,7 @@ const ORDINAL_WORDS: Record<string, number> = {
   fifth: 4, '5th': 4, five: 4,
 };
 
-function normalise(msg: string): string {
+export function normalise(msg: string): string {
   return msg.toLowerCase().trim().replace(/[!.,]+$/g, '').replace(/\s+/g, ' ');
 }
 
@@ -69,7 +69,7 @@ function normalise(msg: string): string {
  * fallback silently declined to handle nearly every real reply, falling
  * through to the general LLM path, which has no equivalent persistence at
  * all (it can verbally repeat the name back without ever saving it). */
-function stripNameFraming(msg: string): string {
+export function stripNameFraming(msg: string): string {
   return msg
     .replace(/^\s*(?:yeah|yes|yep|yup|sure|okay|ok|well|so|alright)[,.]?\s*/i, '')
     .replace(/^\s*(?:it'?s|this is|that'?s|my name'?s|my name is|the name'?s|the name is|name'?s|name is|i'?m called|i'?m|i am|call me)\s*/i, '')
@@ -299,6 +299,9 @@ async function continueBookingFlow(
   const result = await performBooking({
     tenantId: ctx.tenantId, sessionId: ctx.sessionId, visitorId: ctx.visitorId, pageUrl: ctx.pageUrl,
     slot, firstName, lastName, email, phone, topic: leadCaptureState.service, staffId: bookingState.selectedStaffId,
+    leadScore: leadCaptureState.leadScore, buyingIntent: leadCaptureState.buyingIntent,
+    interestedItems: leadCaptureState.interestedItems, requirement: leadCaptureState.requirement,
+    conversationSummary: leadCaptureState.conversationSummary,
   });
 
   if (result.ok) {

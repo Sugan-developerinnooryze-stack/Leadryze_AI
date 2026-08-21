@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentTool } from './tool.types';
 import { retrieveContext } from '../rag/pipeline';
+import { screenFieldForInjection } from '../utils/redact-injection';
 
 const schema = z.object({
   query: z.string().min(1).describe('A focused rephrasing of what the visitor wants to know, used to search the tenant\'s own website content'),
@@ -19,8 +20,10 @@ export const searchWebsiteKnowledgeTool: AgentTool<z.infer<typeof schema>> = {
     if (!results.length) {
       return { ok: true, summary: 'No matching website content found for this query.' };
     }
+    // Hardening Gap 7 — crawled page content is externally-controlled text,
+    // screened per-passage before it reaches the model.
     const block = results
-      .map((r, i) => `[${i + 1} — ${r.source}] ${r.content}`)
+      .map((r, i) => `[${i + 1} — ${r.source}] ${screenFieldForInjection(r.source, r.content)}`)
       .join('\n\n');
     return {
       ok: true,

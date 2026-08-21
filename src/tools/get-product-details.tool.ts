@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentTool } from './tool.types';
 import { backendClient } from '../services/backend.client';
+import { screenFieldForInjection } from '../utils/redact-injection';
 
 const schema = z.object({
   sku: z.string().min(1).describe('The exact SKU of one of the products just found via search_products — never invent one yourself'),
@@ -18,14 +19,18 @@ export const getProductDetailsTool: AgentTool<z.infer<typeof schema>> = {
     if (!item) {
       return { ok: false, summary: `No product found with SKU "${args.sku}" — call search_products again to find the correct SKU.` };
     }
+    // Hardening Gap 7 — screened per-field, not per-record: a flagged spec
+    // value shouldn't hide the title, other specs, or the description.
+    const title = screenFieldForInjection('title', item.title, { sku: args.sku });
+    const longDescription = item.longDescription ? screenFieldForInjection('longDescription', item.longDescription, { sku: args.sku }) : undefined;
     const specLines = item.specifications
-      ? Object.entries(item.specifications).map(([k, v]) => `${k}: ${v}`).join('; ')
+      ? Object.entries(item.specifications).map(([k, v]) => `${k}: ${screenFieldForInjection(k, String(v), { sku: args.sku })}`).join('; ')
       : '';
     return {
       ok: true,
-      summary: `${item.title}${item.longDescription ? ` — ${item.longDescription}` : ''}${specLines ? ` (Specifications: ${specLines})` : ''}`,
+      summary: `${title}${longDescription ? ` — ${longDescription}` : ''}${specLines ? ` (Specifications: ${specLines})` : ''}`,
       data: {
-        title: item.title,
+        title,
         specifications: item.specifications,
         pdfs: item.pdfs,
         images: item.images,

@@ -9,6 +9,98 @@ import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type { ZodSchema } from 'zod';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
+import { toJsonSchema } from '@langchain/core/utils/json_schema';
+
+/** Gemini tool-schema sanitizer — real, live-confirmed root cause (traced
+ * directly, not assumed): `@langchain/google-genai`'s own conversion path
+ * for LangChain tools (utils/common.js's convertToGenerativeAITools() ->
+ * schemaToGenerativeAIParameters()) hands Gemini's API the RAW output of
+ * toJsonSchema() with zero nullable-union sanitization. A Zod `.nullish()`
+ * field (used throughout this codebase's tool schemas specifically to
+ * handle Groq's own quirk of emitting explicit `null` for an unset
+ * optional arg — see search-products.tool.ts's own comment) compiles to
+ * `{"type": ["string", "null"]}` — a JSON array — which Gemini's stricter,
+ * protobuf-backed schema format rejects outright with a real 400
+ * ("Unknown name 'type' ... Proto field is not repeating, cannot start
+ * list"), confirmed live against this exact shape. Recursively walks a
+ * JSON-schema tree and collapses any nullable-union `type` array into
+ * Gemini's expected form: the single real type plus a sibling
+ * `nullable: true` flag. */
+function isNullSchemaNode(node: unknown): boolean {
+  return !!node && typeof node === 'object' && (node as Record<string, unknown>).type === 'null'
+    && Object.keys(node as Record<string, unknown>).length === 1;
+}
+
+function sanitizeSchemaForGemini(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(sanitizeSchemaForGemini);
+  if (node === null || typeof node !== 'object') return node;
+
+  const obj = node as Record<string, unknown>;
+
+  // Second real, live-confirmed nullable shape (distinct from the
+  // `"type": ["x","null"]` array case above) — a Zod `.nullable()` on a
+  // non-primitive field (an object/array, e.g. QueryPlanSchema's
+  // `filters`/`sort`/`aggregation`) produces `"anyOf": [<realSchema>,
+  // {"type":"null"}]` instead, which Gemini's schema format also can't
+  // accept as-is (its own `anyOf` support is limited/undocumented for this
+  // shape — treated defensively the same way: flatten to the real schema
+  // plus a sibling `nullable: true`, never leave the raw anyOf/null pair
+  // in place). Only collapses the clean 2-branch "real schema OR null"
+  // case; a genuine multi-type anyOf falls through unmodified rather than
+  // guessing.
+  if (Array.isArray(obj.anyOf) && obj.anyOf.length === 2) {
+    const [a, b] = obj.anyOf as unknown[];
+    const real = isNullSchemaNode(a) ? b : isNullSchemaNode(b) ? a : undefined;
+    const hasNullBranch = isNullSchemaNode(a) || isNullSchemaNode(b);
+    if (real !== undefined && hasNullBranch) {
+      const { anyOf: _anyOf, ...rest } = obj;
+      const sanitizedReal = sanitizeSchemaForGemini(real) as Record<string, unknown>;
+      const sanitizedRest = sanitizeSchemaForGemini(rest) as Record<string, unknown>;
+      const merged = { ...sanitizedReal, ...sanitizedRest };
+      merged.nullable = true;
+      return merged;
+    }
+  }
+
+  const sanitized: Record<string, unknown> = {};
+  let nullable = false;
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'type' && Array.isArray(value)) {
+      const nonNullTypes = value.filter((t) => t !== 'null');
+      if (value.includes('null')) nullable = true;
+      // A real union of >1 non-null types has no clean single-type Gemini
+      // equivalent — falls back to the first one rather than dropping the
+      // field entirely (a slightly loose type beats an invalid request).
+      sanitized[key] = nonNullTypes[0] ?? 'string';
+    } else {
+      sanitized[key] = sanitizeSchemaForGemini(value);
+    }
+  }
+  if (nullable) sanitized.nullable = true;
+  return sanitized;
+}
+
+/** Builds Gemini-safe tool definitions from this codebase's normal
+ * DynamicStructuredTool[] — deliberately bypasses @langchain/google-genai's
+ * own (buggy, for this codebase's schemas) Zod->Gemini conversion entirely
+ * by pre-converting to the OpenAI tool-call shape ({type:'function',
+ * function:{name, description, parameters}}) with an already-sanitized
+ * JSON schema. Google's own conversion path for THIS shape
+ * (convertOpenAIToolToGenAI, utils/tools.js) only strips
+ * additionalProperties — it does no further schema rewriting, so a
+ * pre-sanitized schema passes through untouched. Only ever used for the
+ * `gemini` provider — Groq/OpenAI/Anthropic never see this, and don't need
+ * it (none of them reject a nullable-union type array). */
+function toGeminiSafeTools(tools: DynamicStructuredTool[]): Array<{ type: 'function'; function: { name: string; description: string; parameters: unknown } }> {
+  return tools.map((tool) => ({
+    type: 'function' as const,
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: sanitizeSchemaForGemini(toJsonSchema(tool.schema as any)),
+    },
+  }));
+}
 
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant';
@@ -59,6 +151,20 @@ function createModel(provider: string, model: string): BaseChatModel {
         apiKey: config.google.apiKey,
         temperature: 0.3,
       }) as unknown as BaseChatModel;
+    // OpenRouter's API is genuinely OpenAI-compatible (same request/response
+    // shape, including tools) — reusing ChatOpenAI with a custom baseURL
+    // rather than a separate client, per this being real OpenAI-compatible
+    // API surface, not a new agent architecture. See .env's own comment on
+    // why openai/gpt-oss-20b:free was chosen and its one known limitation
+    // (unreliable withStructuredOutput() — tool-calling itself is solid).
+    case 'openrouter':
+      return new ChatOpenAI({
+        model,
+        apiKey: config.openrouter.apiKey,
+        configuration: { baseURL: 'https://openrouter.ai/api/v1' },
+        maxTokens: config.llm.maxTokens,
+        temperature: 0.3,
+      });
     case 'openai':
     default:
       return new ChatOpenAI({
@@ -168,8 +274,16 @@ class ModelAbstractionLayer {
         ]);
         return true;
       } catch (err) {
+        // Wording note: this is a diagnostic ping only — its result is never
+        // stored or checked before a real call, so this does NOT block or
+        // skip the model for actual requests. A real turn independently
+        // retries this exact model and may still succeed even after this
+        // log fires (confirmed live: a prior version of this message
+        // ("every call that reaches this model will fail until this is
+        // fixed") was read as a hard gate and caused real confusion
+        // diagnosing an unrelated live issue — it never was one).
         logger.error(
-          `[LLM HEALTH CHECK] ${label} model (${providerModel}) failed a live ping at boot — every call that reaches this model will fail until this is fixed`,
+          `[LLM HEALTH CHECK] ${label} model (${providerModel}) failed a live ping at boot — diagnostic only, does not block real requests to this model`,
           { error: (err as Error).message }
         );
         return false;
@@ -240,15 +354,29 @@ class ModelAbstractionLayer {
    * Groq-strict-mode `failed_generation` JSON salvage) still layer that on
    * top themselves — this method only handles the generic
    * primary-then-fallback retry, not every provider's own quirks. */
+  /** withStructuredOutput() accepts either a raw Zod schema OR an
+   * already-converted JSON schema object — LangChain detects which was
+   * passed. For the `gemini` provider specifically, pass the pre-sanitized
+   * JSON schema instead of the raw Zod schema: withStructuredOutput()'s
+   * own internal Zod->Gemini conversion is the SAME buggy path already
+   * fixed for tool-binding (confirmed live: the identical "Proto field is
+   * not repeating, cannot start list" 400 on a genuinely different call
+   * site — LLM.generateStructured(), used by the dataset query-router's
+   * classifier — not just invokeWithTools()). Groq/OpenAI/Anthropic keep
+   * getting the raw Zod schema unchanged; they don't have this problem. */
+  private structuredSchemaFor(model: BaseChatModel, schema: ZodSchema<unknown>): unknown {
+    return model instanceof ChatGoogleGenerativeAI ? sanitizeSchemaForGemini(toJsonSchema(schema as any)) : schema;
+  }
+
   async generateStructured<T>(messages: LLMMessage[], schema: ZodSchema<T>): Promise<T> {
     try {
-      const model = (this.primary as any).withStructuredOutput(schema);
+      const model = (this.primary as any).withStructuredOutput(this.structuredSchemaFor(this.primary, schema));
       return await model.invoke(messages as any);
     } catch (primaryErr) {
       logger.warn('Primary LLM structured-output failed, switching to fallback', {
         error: (primaryErr as Error).message,
       });
-      const model = (this.fallback as any).withStructuredOutput(schema);
+      const model = (this.fallback as any).withStructuredOutput(this.structuredSchemaFor(this.fallback, schema));
       return await model.invoke(messages as any);
     }
   }
@@ -306,7 +434,7 @@ class ModelAbstractionLayer {
   ): Promise<{ message: AIMessage; provider: string; model: string }> {
     const bind = (model: BaseChatModel) =>
       typeof (model as any).bindTools === 'function' && tools.length
-        ? (model as any).bindTools(tools)
+        ? (model as any).bindTools(model instanceof ChatGoogleGenerativeAI ? toGeminiSafeTools(tools) : tools)
         : model;
 
     const PER_CALL_TIMEOUT_MS = opts.timeoutMs ?? 20000;
@@ -379,12 +507,12 @@ class ModelAbstractionLayer {
   async invokeWithToolsStream(
     lcMessages: BaseMessage[],
     tools: DynamicStructuredTool[],
-    opts: { overrideProvider?: string; overrideModel?: string; timeoutMs?: number; singleAttempt?: boolean } = {},
+    opts: { overrideProvider?: string; overrideModel?: string; timeoutMs?: number; singleAttempt?: boolean; forceFallback?: boolean } = {},
     onChunk?: (delta: string) => void,
   ): Promise<{ message: AIMessage; provider: string; model: string }> {
     const bind = (model: BaseChatModel) =>
       typeof (model as any).bindTools === 'function' && tools.length
-        ? (model as any).bindTools(tools)
+        ? (model as any).bindTools(model instanceof ChatGoogleGenerativeAI ? toGeminiSafeTools(tools) : tools)
         : model;
 
     const PER_CALL_TIMEOUT_MS = opts.timeoutMs ?? 20000;
@@ -404,6 +532,16 @@ class ModelAbstractionLayer {
       if (!accumulated) throw new Error('Empty stream response');
       return { message: accumulated as unknown as AIMessage, provider: providerName, model: modelName };
     };
+
+    // Mirrors invokeWithTools()'s own forceFallback handling — runner.ts's
+    // final-call retry (on a real, confirmed Groq quirk: rejecting its own
+    // tool-call-shaped output when tools=[]) needs the SAME capability on
+    // the streamed variant, not just the plain one, so a continuous-voice
+    // caller's onChunk still gets real incremental output on a successful
+    // retry instead of silently falling through with no forceFallback effect.
+    if (opts.forceFallback) {
+      return await runStream(this.fallback, config.llm.fallbackProvider, config.llm.fallbackModel);
+    }
 
     if (opts.overrideProvider && opts.overrideModel) {
       const overrideModel = this.getOverrideModel(opts.overrideProvider, opts.overrideModel);

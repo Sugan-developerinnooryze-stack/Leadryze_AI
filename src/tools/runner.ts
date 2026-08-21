@@ -122,13 +122,36 @@ export async function runToolLoop(opts: {
    * only during the one narrow window where a false "you're confirmed!"
    * would actually matter. */
   deferStreamingForConfirmationRisk?: boolean;
+  /** Seeds the loop with a tool call that was ALREADY executed by the caller
+   * before this function was even invoked (e.g. base.agent.ts's
+   * deterministic search_dataset pre-fetch — see the plan's "Reliability +
+   * Latency" section for why: a small/fast model doesn't reliably decide TO
+   * call a lookup tool on its own, so the caller removes that discretion by
+   * doing the lookup itself and handing the result in already "done"). A
+   * synthetic AIMessage (with a matching tool_calls entry) + the real
+   * ToolMessage result are appended to lcMessages before the very first
+   * iteration, so the model's first real call already sees a natural,
+   * complete tool-call/response pair in its own history — exactly as if it
+   * had called the tool itself a moment ago — and can go straight to
+   * synthesizing a prose answer, or still call the SAME or a different tool
+   * again for a genuine follow-up need (nothing is removed, only a head
+   * start is given). The matching ToolCallLog entry is also seeded up
+   * front, so every existing downstream consumer of the returned
+   * `toolCalls` array (confidence scoring, item-card extraction, buying-
+   * intent signals) sees a real, successful hit with zero changes needed on
+   * their end. */
+  preToolResult?: {
+    toolName: string;
+    args: Record<string, unknown>;
+    result: { ok: boolean; summary: string; data?: Record<string, unknown> };
+  };
 }): Promise<ToolLoopResult> {
   // Kept comfortably under the backend's own axios proxy timeout to /api/chat
   // (raised to 100s for the tool-calling path — see ai.routes.ts) — 35s of
   // iteration budget + worst-case 40s for the final unbound call
   // (primary+fallback each capped at 20s by invokeWithTools) leaves real
   // margin rather than racing that outer boundary.
-  const { messages, tools, ctx, surface, maxIterations = 3, budgetMs = 35_000, toolModelOverride, onChunk, timeoutMs, fastDegrade, deferStreamingForConfirmationRisk } = opts;
+  const { messages, tools, ctx, surface, maxIterations = 3, budgetMs = 35_000, toolModelOverride, onChunk, timeoutMs, fastDegrade, deferStreamingForConfirmationRisk, preToolResult } = opts;
   const overrideOpts = toolModelOverride
     ? { overrideProvider: toolModelOverride.provider, overrideModel: toolModelOverride.model }
     : {};
@@ -142,6 +165,19 @@ export async function runToolLoop(opts: {
   const toolCalls: ToolCallLog[] = [];
   let usage: UsageMetadata | undefined;
   const iterationTimingsMs: number[] = [];
+
+  if (preToolResult) {
+    const seededCallId = `pre_${preToolResult.toolName}`;
+    lcMessages = [
+      ...lcMessages,
+      new AIMessage({
+        content: '',
+        tool_calls: [{ name: preToolResult.toolName, args: preToolResult.args, id: seededCallId }],
+      }),
+      new ToolMessage({ content: JSON.stringify(preToolResult.result), tool_call_id: seededCallId }),
+    ];
+    toolCalls.push({ name: preToolResult.toolName, ok: preToolResult.result.ok, ms: 0, data: preToolResult.result.data });
+  }
 
   for (let iteration = 0; iteration < maxIterations && Date.now() < deadline; iteration++) {
     const iterationStart = Date.now();
@@ -294,11 +330,43 @@ export async function runToolLoop(opts: {
       provider, model, toolCalls, usage, iterationTimingsMs, finalCallMs,
     };
   } catch (finalErr) {
-    // Both the primary AND fallback models are unavailable for this final
-    // call too (e.g. a genuine provider outage) — the visitor still gets a
-    // safe, escalating reply rather than an unhandled exception reaching
-    // base.agent.ts's own generic, non-escalating "trouble connecting" catch.
-    logger.error('Final unbound call also failed — returning the hardcoded handoff message', { error: (finalErr as Error).message });
-    return { content: HANDOFF_MESSAGE, provider: 'none', model: 'none', toolCalls, usage, iterationTimingsMs, finalCallMs: Date.now() - finalCallStart };
+    // Real, confirmed live bug: this call passes tools=[], but the model can
+    // still see real tool-call/ToolMessage exchanges earlier in THIS turn's
+    // own history and sometimes mimics that shape in its output anyway —
+    // Groq's server-side validator then rejects the whole request outright
+    // ("Tool choice is none, but model called a tool"). On the text-chat
+    // path this call runs with singleAttempt (fastDegrade), so
+    // invokeWithTools()'s own internal primary->fallback retry never gets a
+    // chance to run — the very first failure throws straight through to
+    // here. One explicit retry against the fallback provider, mirroring the
+    // exact forceFallback pattern already used above for malformed
+    // mid-loop syntax, gives a real second chance before giving up — a
+    // provider-specific quirk on the primary is not guaranteed to repeat on
+    // the fallback. Retries via the SAME call shape (streamed vs not) the
+    // first attempt used, so a continuous-voice caller's onChunk still gets
+    // real incremental output on a successful retry, not a silent gap.
+    logger.warn('Final unbound call failed — retrying once against the fallback provider', { error: (finalErr as Error).message });
+    try {
+      let finalMsg: AIMessage, provider: string, model: string;
+      if (onChunk && !deferStreamingForConfirmationRisk) {
+        ({ message: finalMsg, provider, model } = await llm.invokeWithToolsStream(lcMessages, [], { ...callOpts, forceFallback: true }, onChunk));
+      } else {
+        ({ message: finalMsg, provider, model } = await llm.invokeWithTools(lcMessages, [], { ...callOpts, forceFallback: true }));
+      }
+      usage = mergeUsageMetadata(usage, extractUsage(finalMsg));
+      const finalText = contentToString(finalMsg.content);
+      const finalCallMs = Date.now() - finalCallStart;
+      return {
+        content: looksMalformed(finalText) ? HANDOFF_MESSAGE : finalText,
+        provider, model, toolCalls, usage, iterationTimingsMs, finalCallMs,
+      };
+    } catch (retryErr) {
+      // Both the primary AND fallback models are unavailable for this final
+      // call too (e.g. a genuine provider outage) — the visitor still gets a
+      // safe, escalating reply rather than an unhandled exception reaching
+      // base.agent.ts's own generic, non-escalating "trouble connecting" catch.
+      logger.error('Final unbound call also failed — returning the hardcoded handoff message', { error: (retryErr as Error).message });
+      return { content: HANDOFF_MESSAGE, provider: 'none', model: 'none', toolCalls, usage, iterationTimingsMs, finalCallMs: Date.now() - finalCallStart };
+    }
   }
 }

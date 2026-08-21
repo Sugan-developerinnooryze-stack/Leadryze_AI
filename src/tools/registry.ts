@@ -7,6 +7,8 @@ import { searchProductsTool } from './search-products.tool';
 import { getProductDetailsTool } from './get-product-details.tool';
 import { listDepartmentsTool } from './list-departments.tool';
 import { listDoctorsTool } from './list-doctors.tool';
+import { searchDatasetTool } from './search-dataset.tool';
+import { getDatasetRecordTool } from './get-dataset-record.tool';
 
 // Add each new tool here as it's built. `internal_staff` intentionally has
 // no tools in this phase — the existing keyword-matching CRM path in
@@ -19,19 +21,34 @@ const ALL_TOOLS: AgentTool[] = [
   getProductDetailsTool,
   listDepartmentsTool,
   listDoctorsTool,
+  searchDatasetTool,
+  getDatasetRecordTool,
 ];
 
-export type ToolHint = 'booking' | 'catalog' | 'website';
+export type ToolHint = 'booking' | 'catalog' | 'website' | 'dataset';
 
 // Narrows the bound tool set for a clearly single-purpose turn (never blocks
 // it) so that turn doesn't also pay for describing tools it has no use for —
 // e.g. a booking-shaped message doesn't need catalog/RAG tools described.
 // See isBookingOnlyMessage()/isCatalogOnlyMessage()/isWebsiteOnlyMessage() in
 // base.agent.ts for the detectors that choose a hint.
-const TOOL_HINT_NAMES: Record<ToolHint, Set<string>> = {
+// Real, confirmed gap found during Dataset-system hardening: a question
+// like "which products help with X" contains "products" — a
+// CATALOG_ONLY_SIGNAL (base.agent.ts) — and narrowed toolHint to 'catalog'
+// BEFORE search_dataset existed as a tool family. For a tenant with no
+// matching Product Catalog item, search_products correctly found nothing,
+// but search_dataset was never even bound for that turn (excluded by the
+// narrowing), so the model answered from general knowledge instead of the
+// tenant's own uploaded data — a real, live miss, not a hypothetical.
+// Catalog and Dataset are peer "the tenant's own structured business data"
+// tool families with no reliable way to distinguish a visitor's intent
+// from keyword phrasing alone, so 'catalog' includes both rather than
+// risking this exclusion again.
+export const TOOL_HINT_NAMES: Record<ToolHint, Set<string>> = {
   booking: new Set(['check_meeting_availability', 'book_meeting', 'list_departments', 'list_doctors']),
-  catalog: new Set(['search_products', 'get_product_details']),
+  catalog: new Set(['search_products', 'get_product_details', 'search_dataset', 'get_dataset_record']),
   website: new Set(['search_website_knowledge']),
+  dataset: new Set(['search_dataset', 'get_dataset_record']),
 };
 
 // Real, confirmed gap this closes: a tenant with bookingRequireTeam:false

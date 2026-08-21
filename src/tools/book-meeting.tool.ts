@@ -24,6 +24,12 @@ export interface PerformBookingParams {
   tenantId: string; sessionId: string; visitorId?: string; pageUrl?: string;
   slot: { startIso: string; endIso: string; label?: string };
   firstName: string; lastName?: string; email?: string; phone?: string; topic?: string; staffId?: string;
+  // Booking-parity fields — carried over from LeadCaptureState so a visitor
+  // who reaches high buying intent and books directly gets the same rich
+  // Lead the plain "Request Quote" capture path produces.
+  leadScore?: number; buyingIntent?: 'low' | 'medium' | 'high';
+  interestedItems?: Array<{ datasetId: string; recordId: string; title: string; datasetVersion: number }>;
+  requirement?: string; conversationSummary?: string;
 }
 
 export interface PerformBookingResult {
@@ -114,11 +120,13 @@ export function assessBookingReadiness(input: BookingReadinessInput): BookingRea
  * BookingState.offeredSlots and merged contact info with LeadCaptureState;
  * this function only does the actual booking + state persistence. */
 export async function performBooking(params: PerformBookingParams): Promise<PerformBookingResult> {
-  const { tenantId, sessionId, visitorId, pageUrl, slot, firstName, lastName, email, phone, topic, staffId } = params;
+  const { tenantId, sessionId, visitorId, pageUrl, slot, firstName, lastName, email, phone, topic, staffId,
+    leadScore, buyingIntent, interestedItems, requirement, conversationSummary } = params;
 
   const result = await backendClient.bookWidgetMeeting({
     tenantId, sessionId, visitorId, sourceUrl: pageUrl,
     startIso: slot.startIso, endIso: slot.endIso, firstName, lastName, email, phone, topic, staffId,
+    leadScore, buyingIntent, interestedItems, requirement, conversationSummary,
   });
 
   if (!result.success) {
@@ -133,9 +141,18 @@ export async function performBooking(params: PerformBookingParams): Promise<Perf
   await setBookingState(tenantId, sessionId, { ...booking, meetingCreated: true, meetingId: result.meetingId, confirmingSlot: undefined });
   // Keep LeadCaptureState in sync so maybeCaptureWidgetLead() (which runs
   // unconditionally after this) sees leadCreated:true and never attempts a
-  // second, competing Lead for the same session.
+  // second, competing Lead for the same session. lastSent* fields mirror
+  // what was just sent above, so a later chat turn's enrichment path
+  // correctly detects "no meaningful new signal yet" rather than
+  // re-sending the same values immediately.
   const lead = (await getLeadCaptureState(tenantId, sessionId)) ?? {};
-  await setLeadCaptureState(tenantId, sessionId, { ...lead, firstName, lastName, email, phone, service: lead.service || topic || undefined, leadCreated: true, leadId: result.leadId });
+  await setLeadCaptureState(tenantId, sessionId, {
+    ...lead, firstName, lastName, email, phone, service: lead.service || topic || undefined,
+    leadCreated: true, leadId: result.leadId,
+    lastSentBuyingIntent: buyingIntent ?? lead.buyingIntent,
+    lastSentRequirement: requirement ?? lead.requirement,
+    lastSentItemCount: interestedItems?.length ?? lead.interestedItems?.length,
+  });
 
   return {
     ok: true,
@@ -225,6 +242,8 @@ export const bookMeetingTool: AgentTool<z.infer<typeof schema>> = {
     const result = await performBooking({
       tenantId: ctx.tenantId, sessionId: ctx.sessionId, visitorId: ctx.visitorId, pageUrl: ctx.pageUrl,
       slot, firstName, lastName, email, phone, topic, staffId,
+      leadScore: lead.leadScore, buyingIntent: lead.buyingIntent,
+      interestedItems: lead.interestedItems, requirement: lead.requirement, conversationSummary: lead.conversationSummary,
     });
 
     return { ok: result.ok, summary: result.summary };

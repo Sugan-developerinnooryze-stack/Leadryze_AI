@@ -11,7 +11,7 @@ import type { ToolCallLog } from '../tools/runner';
  * score clear a real bar — and decides from those instead.
  */
 export interface ConfidenceResult {
-  source: 'product_catalog' | 'booking' | 'business_profile' | 'website_rag' | 'general';
+  source: 'product_catalog' | 'dataset' | 'booking' | 'business_profile' | 'website_rag' | 'general';
   confidence: number;
 }
 
@@ -30,6 +30,20 @@ export function classifyResponseConfidence(
     (t) => (t.name === 'search_products' || t.name === 'get_product_details') && t.ok && t.data
   );
   if (productHit) return { source: 'product_catalog', confidence: 0.9 };
+
+  // Real, confirmed bug this closes (found via a real tenant's failing
+  // question, not a hypothetical): search_dataset/get_dataset_record were
+  // never added to this whitelist when the Dataset system was built, so a
+  // turn where search_dataset correctly found and returned real data still
+  // fell all the way through to the unrelated ambient website-RAG score
+  // below — near-zero for a question with no matching crawled page — and
+  // had its own correct, grounded answer overridden by the low-confidence
+  // deflection message. Same bug class as productHit/bookingHit above,
+  // just never extended to this newer tool family.
+  const datasetHit = toolCallsLog.find(
+    (t) => (t.name === 'search_dataset' || t.name === 'get_dataset_record') && t.ok && t.data
+  );
+  if (datasetHit) return { source: 'dataset', confidence: 0.9 };
 
   // The visitor asked a profile-shaped question ("tell me about this
   // website", "where are you located"...) AND the tenant has real, crawled

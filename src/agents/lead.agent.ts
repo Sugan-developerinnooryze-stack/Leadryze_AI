@@ -1,6 +1,7 @@
 import { runBaseAgent } from './base.agent';
 import { resolveTenantConfig } from '../services/context.builder';
 import { buildLeadCapturePrompt } from '../prompts/system.prompts';
+import { DatasetItemCard } from './dataset-item-card.types';
 
 export interface LeadAgentInput {
   tenantId: string;
@@ -36,6 +37,8 @@ export interface LeadAgentOutput {
     phone?: string;
     [key: string]: string | undefined;
   };
+  items?: DatasetItemCard[];
+  totalMatches?: number;
 }
 
 export async function runLeadAgent(input: LeadAgentInput): Promise<LeadAgentOutput> {

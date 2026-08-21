@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { AgentTool } from './tool.types';
 import { backendClient } from '../services/backend.client';
 import { cleanArg } from '../utils/clean-arg';
+import { screenFieldForInjection } from '../utils/redact-injection';
 
 const schema = z.object({
   // .nullish(), not just .optional() — confirmed live elsewhere in this
@@ -12,6 +13,17 @@ const schema = z.object({
   query: z.string().nullish().describe('What the visitor is looking for, e.g. "butterfly valve" — omit to just browse a category'),
   category: z.string().nullish().describe('A product category the visitor mentioned, if any'),
 });
+
+/** Scans a product's normalized specifications for anything price-shaped
+ * (key contains "price"/"amount"/"cost"/"fee"/"rate") and surfaces it
+ * inline — spec key names are whatever the tenant's own source columns
+ * happened to be (e.g. "estimated_price_amount_inr"), never a fixed
+ * schema field, so this is a best-effort scan, not an exact-field lookup. */
+function priceHint(specifications?: Record<string, string>): string {
+  if (!specifications) return '';
+  const key = Object.keys(specifications).find((k) => /price|amount|cost|fee|rate/i.test(k));
+  return key ? ` [${specifications[key]}]` : '';
+}
 
 export const searchProductsTool: AgentTool<z.infer<typeof schema>> = {
   name: 'search_products',
@@ -26,8 +38,15 @@ export const searchProductsTool: AgentTool<z.infer<typeof schema>> = {
     if (!items.length) {
       return { ok: true, summary: 'No matching products found in the catalog for this query.' };
     }
+    // Hardening Gap 7 — a product's title/description are tenant-uploaded,
+    // attacker-reachable text; screened per-field, not per-record, so one
+    // flagged description doesn't hide a whole product's name/price/SKU.
     const block = items
-      .map((p) => `${p.title}${p.sku ? ` (SKU: ${p.sku})` : ''}${p.category ? ` — ${p.category}` : ''}${p.shortDescription ? `: ${p.shortDescription}` : ''}`)
+      .map((p) => {
+        const title = screenFieldForInjection('title', p.title, { sku: p.sku });
+        const desc = p.shortDescription ? screenFieldForInjection('shortDescription', p.shortDescription, { sku: p.sku }) : undefined;
+        return `${title}${p.sku ? ` (SKU: ${p.sku})` : ''}${p.category ? ` — ${p.category}` : ''}${priceHint(p.specifications)}${desc ? `: ${desc}` : ''}`;
+      })
       .join('\n');
     return {
       ok: true,

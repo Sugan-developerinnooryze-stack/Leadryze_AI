@@ -8,9 +8,9 @@ export const config = {
     internalApiKey: process.env.INTERNAL_API_KEY || 'internal-key',
   },
   llm: {
-    provider: (process.env.LLM_PROVIDER || 'anthropic') as 'openai' | 'anthropic' | 'gemini' | 'groq' | 'local',
+    provider: (process.env.LLM_PROVIDER || 'anthropic') as 'openai' | 'anthropic' | 'gemini' | 'groq' | 'openrouter' | 'local',
     model: process.env.LLM_MODEL || 'claude-haiku-4-5-20251001',
-    fallbackProvider: (process.env.LLM_FALLBACK_PROVIDER || 'openai') as 'openai' | 'anthropic' | 'gemini' | 'groq' | 'local',
+    fallbackProvider: (process.env.LLM_FALLBACK_PROVIDER || 'openai') as 'openai' | 'anthropic' | 'gemini' | 'groq' | 'openrouter' | 'local',
     fallbackModel: process.env.LLM_FALLBACK_MODEL || 'gpt-4o-mini',
     maxTokens: parseInt(process.env.MAX_TOKENS_PER_REQUEST || '4096', 10),
   },
@@ -26,6 +26,13 @@ export const config = {
   },
   groq: {
     apiKey: process.env.GROQ_API_KEY || '',
+  },
+  // OpenAI-compatible router (openrouter.ai) — reuses ChatOpenAI via a
+  // custom baseURL (llm.provider.ts's createModel()), not a separate client
+  // library, per this being a genuinely OpenAI-compatible API for both
+  // plain chat and tool-calling.
+  openrouter: {
+    apiKey: process.env.OPENROUTER_API_KEY || '',
   },
   embeddings: {
     provider: process.env.EMBEDDING_PROVIDER || 'voyage',
