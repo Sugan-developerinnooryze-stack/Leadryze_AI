@@ -2527,6 +2527,17 @@ async function runBaseAgentInner(input: AgentInput): Promise<AgentOutput> {
         ...(isToolBound('search_dataset') ? [
           'When you answer using search_dataset or get_dataset_record, naturally name the dataset you found it in (e.g. "According to <dataset name>, ...") so the visitor knows where the answer came from.',
           'When a price value from search_dataset is a range, or says something like "On Request" or "Contact for pricing", state it exactly as given — never collapse a range into a single number or state a price as certain when the source marks it as unavailable/on request.',
+          // Real, confirmed bug this closes: the model wrote a raw markdown
+          // image link (![Image](https://...)) into its own prose reply,
+          // duplicating a record's imageUrl field. The widget already
+          // renders every search_dataset result as its own image card
+          // (buildItemCards() in search-dataset.tool.ts) from the tool's
+          // structured `items` output — that is the ONLY channel product
+          // images reach the visitor through. The chat reply text itself
+          // is plain/lightly-formatted prose, not a full Markdown renderer,
+          // so any image syntax or raw image URL placed there shows up as
+          // broken literal text instead of a picture.
+          'Product images are already shown to the visitor automatically, separately from your written reply — never include an image URL, a markdown image link (the ![...](...) syntax), or any other reference to an image file anywhere in your reply text. Describe products in words only.',
         ] : []),
         // Hardening Gap 7 — defense in depth alongside the field-level
         // regex screening already applied inside each tool's own result
