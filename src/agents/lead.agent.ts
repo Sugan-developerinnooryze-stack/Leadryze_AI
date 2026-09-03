@@ -16,6 +16,10 @@ export interface LeadAgentInput {
    * chat.routes.ts's own comment on why this gates the lead-capture flow. */
   visitorId?: string;
   pageUrl?: string;
+  /** Signed identity assertion for the internal CRM-search authorization
+   * path — see AgentInput's own comment (base.agent.ts) for the full
+   * chain. Opaque here, only ever set by chat.routes.ts. */
+  internalAuth?: string;
   /** See AgentInput's own comment (base.agent.ts) — defaults to 'text' when
    * omitted, so every existing caller (chat.routes.ts, voice.routes.ts) is
    * unaffected; only the continuous-voice worker sets this explicitly. */
@@ -70,6 +74,7 @@ export async function runLeadAgent(input: LeadAgentInput): Promise<LeadAgentOutp
     language:    tenantConfig.language,
     visitorId:   input.visitorId,
     pageUrl:     input.pageUrl,
+    internalAuth: input.internalAuth,
     channel:     input.channel,
     abortSignal: input.abortSignal,
     onChunk:     input.onChunk,

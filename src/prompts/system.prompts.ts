@@ -5,6 +5,9 @@ export interface PromptContext {
   customInstructions?: string;
   crmContext?: string;
   customerContext?: string;
+  // True only when the CRM search genuinely ran and found nothing for this
+  // turn's query — see buildCRMQueryPrompt's own use of this below.
+  noRecordsFound?: boolean;
 }
 
 export function buildLeadCapturePrompt(ctx: PromptContext): string {
@@ -122,6 +125,20 @@ RESPONSE FORMAT:
 
 Show max 3-4 fields per record. Always show the connector source (Zoho / HubSpot / Salesforce).
 Language: ${ctx.language || 'English'}`);
+
+  if (ctx.noRecordsFound) {
+    // Dedicated flag, not text appended into crmContext — crmContext is
+    // treated purely as DATA content below (wrapped under a "counts only"
+    // header), so a behavioral rule doesn't belong inside it. Real,
+    // confirmed failure this closes: a zero-match query previously fell
+    // through to Rule 2's softer "ask a follow-up question" framing, which
+    // left the model free to invent a plausible-sounding wrong answer
+    // instead (a fabricated name/status/contact) rather than ever stating
+    // outright that nothing was found.
+    sections.push(`\n🚫 ZERO SEARCH RESULTS FOR THIS QUERY — READ CAREFULLY:
+The CRM search for what the user just asked returned NO matching record. You have NO record-level data about the specific thing they asked about.
+MANDATORY: The FIRST sentence of your reply must plainly state that no matching record was found (e.g., "I couldn't find any record matching that in the CRM."). Do NOT state or imply ANY specific field value (name, role, priority, contact, date, status) about the subject of the query. Only AFTER that opening sentence may you optionally add ONE guiding follow-up question, per Rule 2 above.`);
+  }
 
   if (ctx.crmContext) {
     // Only the module overview (counts) — NOT the customer list

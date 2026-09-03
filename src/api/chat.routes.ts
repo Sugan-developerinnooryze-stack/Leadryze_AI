@@ -26,6 +26,14 @@ const ChatSchema = z.object({
    * tenant's AI assistant never accidentally creates a spurious Lead. */
   visitorId:          z.string().optional(),
   pageUrl:            z.string().optional(),
+  /** Signed, short-lived identity assertion minted by
+   * backend/src/modules/ai/ai.routes.ts (tenantId/role/roleId/userId/
+   * branchId, signed with the backend's own JWT secret) — opaque here,
+   * never interpreted by this service. Passed straight through to
+   * backendClient.searchCRMRecords(), which forwards it to
+   * /api/internal/crm-search for that route to verify and trust. Only
+   * the internal, staff-authenticated proxy sends this. */
+  internalAuth:       z.string().optional(),
 });
 
 const FollowupSchema = z.object({

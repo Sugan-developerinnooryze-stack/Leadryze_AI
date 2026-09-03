@@ -239,12 +239,15 @@ class BackendClient {
     }
   }
 
-  /** Search CRM records by display name across all channels and modules. */
-  async searchCRMRecords(tenantId: string, query: string, limit = 6): Promise<CRMSearchResult[]> {
+  /** Search CRM records by display name across all channels and modules.
+   * `internalAuth` (opaque, forwarded from AgentInput) is the signed
+   * identity assertion /api/internal/crm-search verifies to authorize the
+   * native-CRM portion of this search — see that route's own comments. */
+  async searchCRMRecords(tenantId: string, query: string, limit = 6, internalAuth?: string): Promise<CRMSearchResult[]> {
     try {
       const res = await this.http.get<{ data: CRMSearchResult[] }>(
         `/api/internal/crm-search/${tenantId}`,
-        { params: { q: query, limit } }
+        { params: { q: query, limit, internalAuth } }
       );
       return res.data.data || [];
     } catch {

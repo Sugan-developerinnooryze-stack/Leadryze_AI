@@ -110,7 +110,12 @@ export async function tryRequestQuoteShortcut(
     buyingIntent: 'high', leadScore: Math.max(state.leadScore ?? 0, 85),
   };
 
-  if (!firstName || (!email && !phone)) {
+  // Email is a hard requirement — not "email or phone" — since the backend's
+  // widget-lead-capture endpoint now requires it too (the automatic customer
+  // confirmation email, lead-capture-finalize.ts's downstream Phase 4, can't
+  // reach a lead with no email). Phone stays optional/best-effort, captured
+  // when offered but never blocking.
+  if (!firstName || !email) {
     await setLeadCaptureState(input.tenantId, input.sessionId, {
       ...state,
       ...quoteIntentState,
@@ -122,7 +127,7 @@ export async function tryRequestQuoteShortcut(
     });
     const missing: string[] = [];
     if (!firstName) missing.push('your name');
-    if (!email && !phone) missing.push('an email or phone number');
+    if (!email) missing.push('your email address');
     return {
       handled: true,
       response: `Sure! To send you a quote${itemPhrase}, could I get ${missing.join(' and ')}?`,

@@ -105,7 +105,14 @@ export async function finalizeWidgetLeadCapture(
 
     await setLeadCaptureState(input.tenantId, input.sessionId, state);
 
-    if (state.firstName && (state.email || state.phone)) {
+    // email required, not "email or phone" — matches the backend's own
+    // widget-lead-capture validation and request-quote-shortcut.ts's gate;
+    // fixed here too since this function is the shared tail for BOTH the
+    // deterministic quote-shortcut path and the LLM-assisted extraction path
+    // (maybeCaptureWidgetLead, base.agent.ts) — without this, the LLM path
+    // could still create an email-less lead even though the shortcut path
+    // can't.
+    if (state.firstName && state.email) {
       const result = await backendClient.createLeadFromWidget({
         tenantId:  input.tenantId,
         sessionId: input.sessionId,
