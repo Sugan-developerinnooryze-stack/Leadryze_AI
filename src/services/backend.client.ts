@@ -790,9 +790,9 @@ class BackendClient {
    * mirroring executeDatasetQuery()'s own signature on the backend side. */
   async executeDatasetQuery(
     tenantId: string, datasetId: string, plan: QueryPlan,
-  ): Promise<{ results: Array<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number }>; count?: number; datasetName: string | null }> {
+  ): Promise<{ results: Array<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number }>; count?: number; datasetName: string | null; degraded?: boolean }> {
     try {
-      const res = await this.http.post<{ data: { results: Array<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number }>; count?: number; datasetName: string | null } }>(
+      const res = await this.http.post<{ data: { results: Array<{ recordId: string; data: Record<string, unknown>; datasetId: string; datasetName: string; datasetVersion: number; sourceLabel: string; rowNumber: number }>; count?: number; datasetName: string | null; degraded?: boolean } }>(
         '/api/internal/datasets/query', { tenantId, datasetId, plan },
       );
       return res.data.data ?? { results: [], datasetName: null };

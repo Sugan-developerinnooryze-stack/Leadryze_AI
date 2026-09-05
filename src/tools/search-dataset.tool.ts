@@ -209,10 +209,18 @@ export const searchDatasetTool: AgentTool<z.infer<typeof schema>> = {
     const lines = unseenResults.map((r) => formatRecordLine(r, labelMap)).join('\n');
     const items = buildItemCards(unseenResults, columns, labelMap);
     await appendDatasetBrowseState(ctx.tenantId, ctx.sessionId, target.datasetId, items.map((i) => i.recordId));
+    // `degraded` means the real ranked search failed (embedding-provider
+    // hiccup, etc.) and this is a plain, unranked listing from the dataset
+    // instead — tell the model so it doesn't claim these are precisely
+    // matched, but still let it show them (some real, honestly-labeled
+    // options beat "found nothing").
+    const summaryPrefix = result.degraded
+      ? `A precise search couldn't be completed right now, so here are some items from ${target.name} that may be relevant (not ranked to the exact question):`
+      : `According to ${target.name}, found ${unseenResults.length} matching record(s):`;
     return {
       ok: true,
-      summary: `According to ${target.name}, found ${unseenResults.length} matching record(s):\n${lines}`,
-      data: { datasetName: target.name, records: unseenResults, items, totalMatches },
+      summary: `${summaryPrefix}\n${lines}`,
+      data: { datasetName: target.name, records: unseenResults, items, totalMatches, degraded: result.degraded },
     };
   },
 };
