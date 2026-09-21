@@ -56,6 +56,7 @@ export interface ResolvedTenantConfig {
  * per-tenant via aiConfig.monthlyTokenLimit for a custom deal. */
 const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
   starter: 300_000,
+  growth: 1_000_000,
   professional: 1_500_000,
   enterprise: 8_000_000,
 };
@@ -65,6 +66,7 @@ const DEFAULT_MONTHLY_TOKEN_LIMITS: Record<string, number> = {
  * field (kept in sync manually, same as the token limits above). */
 const DEFAULT_MONTHLY_VOICE_MINUTES_LIMITS: Record<string, number> = {
   starter: 100,
+  growth: 250,
   professional: 500,
   enterprise: 3000,
 };
